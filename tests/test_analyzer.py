@@ -1,0 +1,171 @@
+import subprocess
+import sys
+from pathlib import Path
+from textwrap import dedent
+
+from mcp_doctor.analyzer import analyze_repo
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def write(tmp_path: Path, name: str, content: str) -> Path:
+    p = tmp_path / name
+    p.write_text(dedent(content))
+    return p
+
+
+def test_fastmcp_tool_with_full_docs_passes_clean(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str, days: int) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+                days: How many days out.
+            \"\"\"
+            try:
+                return f"{city} {days}"
+            except ValueError as e:
+                return str(e)
+        """)
+    (tmp_path / "README.md").write_text("# x\n\nHas get_forecast tool.")
+    (tmp_path / "LICENSE").write_text("MIT")
+    (tmp_path / "requirements.txt").write_text("mcp\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("def test_x(): pass")
+
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+    tool = report.tools[0]
+    assert tool.issues == []
+    assert report.percent == 100
+
+
+def test_undocumented_untyped_tool_is_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def do_thing(x, y):
+            return x / y
+        """)
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "description" in checks
+    assert "types" in checks
+    assert "error_handling" in checks
+
+
+def test_bare_except_is_an_error(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def run(cmd: str) -> str:
+            \"\"\"Run a command.\"\"\"
+            try:
+                return cmd
+            except:
+                pass
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    bare_issue = next(i for i in tool.issues if i.check == "bare_except")
+    assert bare_issue.severity == "error"
+
+
+def test_lowlevel_tool_constructor_detected(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+
+        TOOLS = [
+            Tool(
+                name="search",
+                description="Search the knowledge base for relevant docs.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search text"},
+                    },
+                },
+            )
+        ]
+        """)
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+    assert report.tools[0].name == "search"
+    assert report.tools[0].issues == []
+
+
+def test_unparseable_file_is_flagged_not_silently_skipped(tmp_path):
+    write(tmp_path, "server.py", """
+        def broken(
+        """)
+    report = analyze_repo(tmp_path)
+    parse_issue = next((i for i in report.repo_issues if i.check == "parse_error"), None)
+    assert parse_issue is not None
+    assert parse_issue.severity == "error"
+
+
+def test_no_tools_found_gives_empty_report(tmp_path):
+    write(tmp_path, "server.py", "x = 1\n")
+    report = analyze_repo(tmp_path)
+    assert report.tools == []
+
+
+def test_hardcoded_secret_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        api_key = "sk-abcdefghijklmnopqrstuvwx"
+        """)
+    report = analyze_repo(tmp_path)
+    assert any(i.check == "secrets" for i in report.repo_issues)
+
+
+def test_missing_readme_and_license_flagged(tmp_path):
+    write(tmp_path, "server.py", "x = 1\n")
+    report = analyze_repo(tmp_path)
+    checks = {i.check for i in report.repo_issues}
+    assert "readme" in checks
+    assert "license" in checks
+
+
+def test_cli_runs_against_bad_example_and_reports_low_score():
+    example = REPO_ROOT / "examples" / "bad_server"
+    result = subprocess.run(
+        [sys.executable, "-m", "mcp_doctor.cli", str(example), "--json"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert '"score"' in result.stdout
+
+
+def test_cli_fail_under_exits_nonzero_on_bad_example():
+    example = REPO_ROOT / "examples" / "bad_server"
+    result = subprocess.run(
+        [sys.executable, "-m", "mcp_doctor.cli", str(example), "--fail-under", "90"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+
+
+def test_cli_good_example_scores_well():
+    example = REPO_ROOT / "examples" / "good_server"
+    result = subprocess.run(
+        [sys.executable, "-m", "mcp_doctor.cli", str(example), "--fail-under", "50"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
