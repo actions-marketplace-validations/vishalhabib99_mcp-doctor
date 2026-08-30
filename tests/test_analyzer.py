@@ -179,6 +179,50 @@ def test_tool_defined_in_test_file_is_not_counted(tmp_path):
     assert report.tools[0].name == "get_forecast"
 
 
+def test_annotated_field_description_counts_as_param_docs(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(
+            city: Annotated[str, Field(description="The city name.")],
+            days: Annotated[int, Field(description="How many days out.")] = 1,
+        ) -> str:
+            \"\"\"Get a weather forecast.\"\"\"
+            try:
+                return f"{city} {days}"
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+
+
+def test_default_field_description_counts_as_param_docs(tmp_path):
+    write(tmp_path, "server.py", """
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str = Field(description="The city name.")) -> str:
+            \"\"\"Get a weather forecast.\"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+
+
 def test_missing_readme_and_license_flagged(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)

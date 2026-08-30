@@ -106,6 +106,31 @@ def _get_docstring_sections(docstring: str | None) -> set[str]:
     return params
 
 
+def _field_call_has_description(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    if name != "Field":
+        return False
+    desc = _kwarg_str(node, "description")
+    return bool(desc and desc.strip())
+
+
+def _param_documented_via_field(arg: ast.arg, default: ast.expr | None) -> bool:
+    """Pydantic-style per-parameter docs: Annotated[T, Field(description=...)] or `x: T = Field(description=...)`."""
+    annotation = arg.annotation
+    if isinstance(annotation, ast.Subscript):
+        base = annotation.value
+        base_name = base.attr if isinstance(base, ast.Attribute) else (base.id if isinstance(base, ast.Name) else None)
+        if base_name == "Annotated":
+            sl = annotation.slice
+            elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+            if any(_field_call_has_description(e) for e in elts):
+                return True
+    return _field_call_has_description(default) if default is not None else False
+
+
 def _find_decorator_call(dec: ast.expr, names: set[str]) -> ast.Call | None:
     node = dec
     if isinstance(node, ast.Call):
@@ -144,9 +169,15 @@ def _contains_try_except(node: ast.AST) -> tuple[bool, bool]:
 def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: str, description_override: str | None = None) -> ToolFinding:
     docstring = ast.get_docstring(fn)
     description = description_override or (docstring.splitlines()[0].strip() if docstring else "")
-    args = [a for a in fn.args.args if a.arg not in ("self", "cls")]
+    all_args = fn.args.args
+    args = [a for a in all_args if a.arg not in ("self", "cls")]
     typed = sum(1 for a in args if a.annotation is not None)
     doc_params = _get_docstring_sections(docstring)
+
+    defaults_by_arg = dict(zip(all_args[len(all_args) - len(fn.args.defaults):], fn.args.defaults))
+    field_documented_names = {a.arg for a in args if _param_documented_via_field(a, defaults_by_arg.get(a))}
+    documented_count = len(doc_params | field_documented_names)
+
     has_try, has_bare = _contains_try_except(fn)
 
     finding = ToolFinding(
@@ -157,7 +188,7 @@ def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: 
         description_len=len(description.strip()),
         param_count=len(args),
         typed_param_count=typed,
-        has_docstring_params=len(doc_params) >= len(args) and len(args) > 0,
+        has_docstring_params=documented_count >= len(args) and len(args) > 0,
         has_try_except=has_try,
         has_bare_except=has_bare,
     )
@@ -185,7 +216,8 @@ def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: 
     if args and not finding.has_docstring_params:
         finding.issues.append(ToolIssue(
             fn.name, file, fn.lineno, "param_docs",
-            "Parameters aren't documented in an Args: section — the model only sees names, not intent.",
+            "Parameters aren't documented — no Args: docstring section and no per-parameter "
+            "Field(description=...) — the model only sees names, not intent.",
             "warning",
         ))
 
