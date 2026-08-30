@@ -7,6 +7,10 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Vishal Habib" }]
 keywords = ["mcp", "model-context-protocol", "agents", "llm", "linter", "static-analysis"]
+dependencies = [
+    "tree-sitter>=0.23",
+    "tree-sitter-typescript>=0.23",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

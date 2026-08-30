@@ -65,7 +65,9 @@ mcp-doctor . --fail-under 80      # exit 1 if score drops below 80% — wire int
 
 ## What it checks
 
-**Per tool** (detects both the FastMCP `@mcp.tool()` decorator style and the low-level SDK's `Tool(name=..., description=..., inputSchema=...)` style):
+Audits both Python and TypeScript/JavaScript servers in the same repo. Python detects the FastMCP `@mcp.tool()` decorator style and the low-level SDK's `Tool(name=..., description=..., inputSchema=...)` style; TS/JS detects the official SDK's `server.registerTool(name, config, handler)` and `server.tool(name, description, schema, handler)` styles, including the common pattern where the config object or Zod schema is a same-file `const` reference rather than inline. The same checks apply either way — a description, per-parameter docs (`Args:`/`Field(description=...)` in Python, `.describe(...)` on each Zod field in TS), and a try/except (or try/catch).
+
+**Per tool**:
 
 | Check | Why it matters |
 |---|---|
@@ -97,14 +99,14 @@ A maintainer on `ha-mcp` reviewed the resulting report in detail and pushed back
 
 ## Known limitations
 
-- **Python only.** No TypeScript/JS support yet, despite that being a large share of the MCP server ecosystem — see [Roadmap](#roadmap).
-- **AST-based, single-pass.** Tools constructed dynamically in a loop, or schemas built from something other than a dict literal or a `pydantic` `model_json_schema()` call, won't be fully introspected — you'll get the tool detected but a blind spot on its parameter-level checks rather than a false failure.
-- **Parses with the running interpreter's grammar.** See the spot check above — run under a Python version that matches or exceeds the syntax used in the server you're auditing.
-- **Doesn't follow delegation.** If a `@mcp.tool()` function immediately hands off to a helper (`return await do_the_real_work(...)`) that has its own try/except, the error-handling check only looks at the decorated function's own body and reports a false positive — it has no call-graph analysis.
+- **AST-based, single-pass.** Tools constructed dynamically in a loop, or schemas built from something other than a dict literal or a `pydantic` `model_json_schema()` call, won't be fully introspected — you'll get the tool detected but a blind spot on its parameter-level checks rather than a false failure. A dynamic tool *name* (not a string literal, e.g. built in a loop) means the tool is skipped entirely rather than misattributed.
+- **Parses with the running interpreter's grammar (Python side).** See the spot check above — run under a Python version that matches or exceeds the syntax used in the server you're auditing.
+- **Doesn't follow delegation.** If a tool function immediately hands off to a helper that has its own try/except (or try/catch), the error-handling check only looks at the decorated function's own body and reports a false positive — it has no call-graph analysis.
+- **TS/JS const resolution is same-file only.** Unlike the Python side's cross-file `Field` type-alias resolution, a TS config object or Zod schema referenced via an import from another file won't be resolved — only same-file `const` references.
 
 ## Roadmap
 
-- [ ] TypeScript/JS server support (the official SDK's dominant language)
+- [x] TypeScript/JS server support (the official SDK's dominant language) — `registerTool`/`tool` styles, same-file const resolution
 - [ ] Publish to PyPI
 - [ ] `--fix` for the mechanical stuff (stub `Args:` sections, wrap in try/except)
 - [ ] GitHub Action for one-line CI integration

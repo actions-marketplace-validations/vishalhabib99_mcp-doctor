@@ -23,3 +23,5 @@ jobs:
         run: |
           python -m mcp_doctor.cli examples/good_server --fail-under 90
           python -m mcp_doctor.cli examples/bad_server --json
+          python -m mcp_doctor.cli examples/good_server_ts --fail-under 90
+          python -m mcp_doctor.cli examples/bad_server_ts --json

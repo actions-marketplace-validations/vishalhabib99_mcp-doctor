@@ -315,3 +315,25 @@ def test_cli_good_example_scores_well():
         text=True,
     )
     assert result.returncode == 0
+
+
+def test_cli_good_example_ts_scores_well():
+    example = REPO_ROOT / "examples" / "good_server_ts"
+    result = subprocess.run(
+        [sys.executable, "-m", "mcp_doctor.cli", str(example), "--fail-under", "90"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+
+
+def test_cli_bad_example_ts_reports_low_score():
+    example = REPO_ROOT / "examples" / "bad_server_ts"
+    result = subprocess.run(
+        [sys.executable, "-m", "mcp_doctor.cli", str(example), "--fail-under", "50"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1

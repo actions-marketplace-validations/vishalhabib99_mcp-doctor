@@ -416,6 +416,10 @@ def _scan_secrets(py_files: list[Path]) -> list[RepoIssue]:
 
 
 def analyze_repo(root: Path) -> Report:
+    # Lazy import: ts_analyzer imports ToolFinding/ToolIssue from this module,
+    # so importing it at module load time would be circular.
+    from .ts_analyzer import find_ts_tools
+
     py_files = [p for p in root.rglob("*.py") if "/.git/" not in str(p) and "/venv/" not in str(p) and "/node_modules/" not in str(p)]
 
     trees: list[tuple[str, ast.Module]] = []
@@ -444,6 +448,10 @@ def analyze_repo(root: Path) -> Report:
     for rel, tree in trees:
         tools.extend(_find_fastmcp_tools(tree, rel, alias_registry))
         tools.extend(_find_lowlevel_tools(tree, rel))
+
+    ts_tools, ts_unparseable = find_ts_tools(root)
+    tools.extend(ts_tools)
+    unparseable.extend(ts_unparseable)
 
     repo_issues: list[RepoIssue] = []
 
@@ -474,14 +482,29 @@ def analyze_repo(root: Path) -> Report:
     if not any(root.glob("LICENSE*")):
         repo_issues.append(RepoIssue("license", "No LICENSE file — undermines adoption.", "warning"))
 
-    has_tests = any(root.rglob("test_*.py")) or any(root.rglob("*_test.py")) or (root / "tests").is_dir()
+    has_tests = (
+        any(root.rglob("test_*.py"))
+        or any(root.rglob("*_test.py"))
+        or any(root.rglob("*.test.ts"))
+        or any(root.rglob("*.spec.ts"))
+        or (root / "tests").is_dir()
+        or any(p.name == "__tests__" for p in root.rglob("__tests__"))
+    )
     if not has_tests:
         repo_issues.append(RepoIssue("tests", "No test files found.", "warning"))
 
-    if not (root / "pyproject.toml").exists() and not (root / "requirements.txt").exists() and not (root / "setup.py").exists():
-        repo_issues.append(RepoIssue("packaging", "No pyproject.toml/requirements.txt/setup.py — dependencies aren't pinned.", "warning"))
+    has_py_packaging = (root / "pyproject.toml").exists() or (root / "requirements.txt").exists() or (root / "setup.py").exists()
+    has_js_packaging = (root / "package.json").exists()
+    if not has_py_packaging and not has_js_packaging:
+        repo_issues.append(RepoIssue("packaging", "No pyproject.toml/requirements.txt/setup.py/package.json — dependencies aren't pinned.", "warning"))
 
-    repo_issues.extend(_scan_secrets(py_files))
+    ts_js_files = [
+        p for p in root.rglob("*")
+        if p.suffix in (".ts", ".tsx", ".js", ".jsx")
+        and "/node_modules/" not in str(p) and "/.git/" not in str(p)
+        and not _is_test_file(p)
+    ]
+    repo_issues.extend(_scan_secrets(py_files + ts_js_files))
 
     score = 0
     max_score = 0
