@@ -326,6 +326,8 @@ def analyze_repo(root: Path) -> Report:
     tools: list[ToolFinding] = []
     unparseable: list[str] = []
     for f in py_files:
+        if _is_test_file(f):
+            continue
         try:
             tree = ast.parse(f.read_text(errors="ignore"), filename=str(f))
         except SyntaxError:

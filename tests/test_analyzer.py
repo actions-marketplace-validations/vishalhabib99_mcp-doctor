@@ -148,6 +148,37 @@ def test_secret_pattern_in_test_file_is_not_flagged(tmp_path):
     assert not any(i.check == "secrets" for i in report.repo_issues)
 
 
+def test_tool_defined_in_test_file_is_not_counted(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+        """)
+    (tmp_path / "tests").mkdir()
+    write(tmp_path, "tests/test_middleware.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def fake_tool_for_testing(x):
+            return x
+        """)
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+    assert report.tools[0].name == "get_forecast"
+
+
 def test_missing_readme_and_license_flagged(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)
