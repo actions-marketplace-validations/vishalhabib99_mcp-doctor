@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SECRET_PATTERN = re.compile(
-    r"""(api[_-]?key|secret|token|password|access[_-]?key)\s*=\s*["'][A-Za-z0-9_\-/+]{12,}["']""",
+    r"""(api[_-]?key|secret|token|password|access[_-]?key)\s*=\s*["'](?=[^"']*\d)[A-Za-z0-9_\-/+]{12,}["']""",
     re.IGNORECASE,
 )
 
@@ -294,9 +294,18 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
     return findings
 
 
+def _is_test_file(path: Path) -> bool:
+    name = path.name
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    return any(part in ("test", "tests") for part in path.parts)
+
+
 def _scan_secrets(py_files: list[Path]) -> list[RepoIssue]:
     issues = []
     for f in py_files:
+        if _is_test_file(f):
+            continue
         try:
             text = f.read_text(errors="ignore")
         except OSError:

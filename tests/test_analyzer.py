@@ -123,10 +123,29 @@ def test_no_tools_found_gives_empty_report(tmp_path):
 
 def test_hardcoded_secret_flagged(tmp_path):
     write(tmp_path, "server.py", """
-        api_key = "sk-abcdefghijklmnopqrstuvwx"
+        api_key = "sk-ab12cd34ef56gh78ij90kl"
         """)
     report = analyze_repo(tmp_path)
     assert any(i.check == "secrets" for i in report.repo_issues)
+
+
+def test_identifier_named_like_a_secret_is_not_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        SERVICE_GET_CALLER_TOKEN = "get_caller_token"
+        OAUTH_MODE_TOKEN = "oauth-mode-token"
+        """)
+    report = analyze_repo(tmp_path)
+    assert not any(i.check == "secrets" for i in report.repo_issues)
+
+
+def test_secret_pattern_in_test_file_is_not_flagged(tmp_path):
+    write(tmp_path, "server.py", "x = 1\n")
+    (tmp_path / "tests").mkdir()
+    write(tmp_path, "tests/test_auth.py", """
+        access_token = "sk-abcdefghijklmnopqrstuvwx"
+        """)
+    report = analyze_repo(tmp_path)
+    assert not any(i.check == "secrets" for i in report.repo_issues)
 
 
 def test_missing_readme_and_license_flagged(tmp_path):

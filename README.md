@@ -91,6 +91,8 @@ Run against three servers from the official [`modelcontextprotocol/servers`](htt
 - **`src/fetch`** — **100% / A**. Clean.
 - **`src/git`**, **`src/time`** — flagged as **parse errors**, not false passes. Both use Python `match` statements (3.10+ syntax); `mcp-doctor`'s AST parser follows the grammar of whatever Python interpreter runs it, so under Python 3.9 those files can't be parsed. Rather than silently skip them and report a misleadingly clean score, `mcp-doctor` surfaces this as an explicit error: *"N file(s) could not be parsed and were skipped."* Run it under Python ≥3.10 to analyze those files correctly.
 
+Later spot-checked against 4 more real, in-the-wild servers (awslabs' `aws-documentation-mcp-server`, `mcp-google-ads`, `sv-excel-agent`, and Home Assistant's `ha-mcp`, a 101-tool server). That run caught a real precision bug in the secret scanner: it was flagging test fixtures and identifier-style constant names (`SERVICE_GET_CALLER_TOKEN = "get_caller_token"`) as hardcoded credentials, dragging `ha-mcp`'s score from what should have been a B down to an F. Fixed by excluding test files/dirs and requiring a digit in the matched value — `ha-mcp` now correctly scores 84%/B instead of 55%/F.
+
 ## Known limitations
 
 - **Python only.** No TypeScript/JS support yet, despite that being a large share of the MCP server ecosystem — see [Roadmap](#roadmap).
