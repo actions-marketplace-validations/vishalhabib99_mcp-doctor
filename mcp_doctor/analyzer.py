@@ -86,6 +86,10 @@ class Report:
         return round(self.score / self.max_score * 100)
 
 
+_ARGS_HEADING = re.compile(r"^#{0,6}\s*\*{0,2}(Args|Arguments|Params|Parameters)\*{0,2}:\*{0,2}\s*$")
+_END_HEADING = re.compile(r"^#{0,6}\s*\*{0,2}(Returns|Raises|Yields|Examples?)\*{0,2}:?\*{0,2}\s*$")
+
+
 def _get_docstring_sections(docstring: str | None) -> set[str]:
     if not docstring:
         return set()
@@ -93,14 +97,15 @@ def _get_docstring_sections(docstring: str | None) -> set[str]:
     in_args = False
     for line in docstring.splitlines():
         stripped = line.strip()
-        if re.match(r"^(Args|Arguments|Params|Parameters):\s*$", stripped):
+        if _ARGS_HEADING.match(stripped):
             in_args = True
             continue
         if in_args:
-            if not stripped or re.match(r"^(Returns|Raises|Yields|Examples?):\s*$", stripped):
+            if not stripped or _END_HEADING.match(stripped):
                 in_args = False
                 continue
-            m = re.match(r"^\**([A-Za-z_][A-Za-z0-9_]*)\**\s*(\(.*\))?\s*:", stripped)
+            # allow a leading bullet marker ("- confirm: ..." / "* confirm: ...")
+            m = re.match(r"^[-*]?\s*\**([A-Za-z_][A-Za-z0-9_]*)\**\s*(\(.*\))?\s*:", stripped)
             if m:
                 params.add(m.group(1))
     return params
@@ -117,18 +122,64 @@ def _field_call_has_description(node: ast.expr) -> bool:
     return bool(desc and desc.strip())
 
 
-def _param_documented_via_field(arg: ast.arg, default: ast.expr | None) -> bool:
-    """Pydantic-style per-parameter docs: Annotated[T, Field(description=...)] or `x: T = Field(description=...)`."""
+def _annotated_elts_have_description(elts: list[ast.expr], alias_registry: dict[str, bool]) -> bool:
+    for e in elts:
+        if _field_call_has_description(e):
+            return True
+        if isinstance(e, ast.Name) and alias_registry.get(e.id):
+            return True
+    return False
+
+
+def _param_documented_via_field(
+    arg: ast.arg, default: ast.expr | None, alias_registry: dict[str, bool] | None = None
+) -> bool:
+    """Pydantic-style per-parameter docs: Annotated[T, Field(description=...)],
+    `x: T = Field(description=...)`, or a type alias (possibly imported from another
+    file) that itself resolves to one of those forms, e.g. `x: SomeFieldAlias = None`
+    where `SomeFieldAlias = Annotated[str, Field(description=...)]` elsewhere.
+    """
+    alias_registry = alias_registry or {}
     annotation = arg.annotation
+    if isinstance(annotation, ast.Name) and alias_registry.get(annotation.id):
+        return True
     if isinstance(annotation, ast.Subscript):
         base = annotation.value
         base_name = base.attr if isinstance(base, ast.Attribute) else (base.id if isinstance(base, ast.Name) else None)
         if base_name == "Annotated":
             sl = annotation.slice
             elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
-            if any(_field_call_has_description(e) for e in elts):
+            if _annotated_elts_have_description(elts, alias_registry):
                 return True
     return _field_call_has_description(default) if default is not None else False
+
+
+def _collect_field_aliases(tree: ast.Module, registry: dict[str, bool]) -> None:
+    """Find module-level `Name = Annotated[T, Field(description=...)]` assignments
+    so parameters annotated with the alias elsewhere (even in another file) are
+    recognized as documented."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            if not names:
+                continue
+            documented = False
+            if isinstance(value, ast.Subscript):
+                base = value.value
+                base_name = base.attr if isinstance(base, ast.Attribute) else (base.id if isinstance(base, ast.Name) else None)
+                if base_name == "Annotated":
+                    sl = value.slice
+                    elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+                    documented = _annotated_elts_have_description(elts, registry)
+            elif _field_call_has_description(value):
+                documented = True
+            if documented:
+                for n in names:
+                    registry[n] = True
 
 
 def _find_decorator_call(dec: ast.expr, names: set[str]) -> ast.Call | None:
@@ -166,7 +217,12 @@ def _contains_try_except(node: ast.AST) -> tuple[bool, bool]:
     return has_try, has_bare
 
 
-def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: str, description_override: str | None = None) -> ToolFinding:
+def _analyze_function_as_tool(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    file: str,
+    description_override: str | None = None,
+    alias_registry: dict[str, bool] | None = None,
+) -> ToolFinding:
     docstring = ast.get_docstring(fn)
     description = description_override or (docstring.splitlines()[0].strip() if docstring else "")
     all_args = fn.args.args
@@ -175,7 +231,9 @@ def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: 
     doc_params = _get_docstring_sections(docstring)
 
     defaults_by_arg = dict(zip(all_args[len(all_args) - len(fn.args.defaults):], fn.args.defaults))
-    field_documented_names = {a.arg for a in args if _param_documented_via_field(a, defaults_by_arg.get(a))}
+    field_documented_names = {
+        a.arg for a in args if _param_documented_via_field(a, defaults_by_arg.get(a), alias_registry)
+    }
     documented_count = len(doc_params | field_documented_names)
 
     has_try, has_bare = _contains_try_except(fn)
@@ -242,7 +300,7 @@ def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: 
     return finding
 
 
-def _find_fastmcp_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
+def _find_fastmcp_tools(tree: ast.Module, file: str, alias_registry: dict[str, bool] | None = None) -> list[ToolFinding]:
     findings = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -254,10 +312,10 @@ def _find_fastmcp_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
                 attr = dec.attr if isinstance(dec, ast.Attribute) else (dec.id if isinstance(dec, ast.Name) else None)
                 if attr not in FASTMCP_DECORATOR_NAMES:
                     continue
-                findings.append(_analyze_function_as_tool(node, file))
+                findings.append(_analyze_function_as_tool(node, file, alias_registry=alias_registry))
                 break
             description_override = _kwarg_str(call, "description")
-            findings.append(_analyze_function_as_tool(node, file, description_override))
+            findings.append(_analyze_function_as_tool(node, file, description_override, alias_registry))
             break
     return findings
 
@@ -360,7 +418,7 @@ def _scan_secrets(py_files: list[Path]) -> list[RepoIssue]:
 def analyze_repo(root: Path) -> Report:
     py_files = [p for p in root.rglob("*.py") if "/.git/" not in str(p) and "/venv/" not in str(p) and "/node_modules/" not in str(p)]
 
-    tools: list[ToolFinding] = []
+    trees: list[tuple[str, ast.Module]] = []
     unparseable: list[str] = []
     for f in py_files:
         if _is_test_file(f):
@@ -370,8 +428,21 @@ def analyze_repo(root: Path) -> Report:
         except SyntaxError:
             unparseable.append(str(f.relative_to(root)))
             continue
-        rel = str(f.relative_to(root))
-        tools.extend(_find_fastmcp_tools(tree, rel))
+        trees.append((str(f.relative_to(root)), tree))
+
+    # Repo-wide Field(description=...) type-alias registry, e.g.
+    # `BestPracticeKeyParam = Annotated[str, Field(description="...")]` defined
+    # in one file and imported/used as a parameter annotation in another.
+    # Two passes catch a one-level alias-of-alias without full import resolution.
+    alias_registry: dict[str, bool] = {}
+    for _, tree in trees:
+        _collect_field_aliases(tree, alias_registry)
+    for _, tree in trees:
+        _collect_field_aliases(tree, alias_registry)
+
+    tools: list[ToolFinding] = []
+    for rel, tree in trees:
+        tools.extend(_find_fastmcp_tools(tree, rel, alias_registry))
         tools.extend(_find_lowlevel_tools(tree, rel))
 
     repo_issues: list[RepoIssue] = []

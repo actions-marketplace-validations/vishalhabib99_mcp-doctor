@@ -223,6 +223,58 @@ def test_default_field_description_counts_as_param_docs(tmp_path):
     assert "param_docs" not in checks
 
 
+def test_cross_file_field_alias_counts_as_param_docs(tmp_path):
+    write(tmp_path, "shared_types.py", """
+        from typing import Annotated
+        from pydantic import Field
+
+        NameParam = Annotated[str, Field(description="The city name.")]
+        """)
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from mcp.server.fastmcp import FastMCP
+        from .shared_types import NameParam
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: NameParam = None) -> str:
+            \"\"\"Get a weather forecast.\"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+
+
+def test_bold_bulleted_parameters_heading_recognized(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def ha_restart(confirm: bool = False) -> dict:
+            \"\"\"
+            Restart the system.
+
+            **Parameters:**
+            - confirm: Must be set to True to confirm the restart. This is a
+                       safety measure to prevent accidental restarts.
+            \"\"\"
+            try:
+                return {"ok": confirm}
+            except ValueError as e:
+                return {"error": str(e)}
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+
+
 def test_missing_readme_and_license_flagged(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)
