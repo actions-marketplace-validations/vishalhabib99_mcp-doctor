@@ -83,8 +83,9 @@ Audits both Python and TypeScript/JavaScript servers in the same repo. Python de
 - README exists, and mentions every tool you export
 - LICENSE exists
 - Tests exist
-- Dependencies are declared (`pyproject.toml` / `requirements.txt` / `setup.py`)
+- Dependencies are declared (`pyproject.toml` / `requirements.txt` / `setup.py` / `package.json`)
 - No hardcoded-looking API keys/secrets/tokens in source
+- Tool names conform to the [spec's Tool Names guidance](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool-names) (1–128 chars, `A-Z a-z 0-9 _ - .` only, unique within the server)
 
 ## Real-world spot check
 
@@ -96,6 +97,8 @@ Run against three servers from the official [`modelcontextprotocol/servers`](htt
 Later spot-checked against 4 more real, in-the-wild servers (awslabs' `aws-documentation-mcp-server`, `mcp-google-ads`, `sv-excel-agent`, and Home Assistant's `ha-mcp`, an 88-tool server). That run caught two real precision bugs: the secret scanner was flagging test fixtures and identifier-style constant names (`SERVICE_GET_CALLER_TOKEN = "get_caller_token"`) as hardcoded credentials, and the param-docs check didn't recognize `Annotated[T, Field(description=...)]` — a completely valid, schema-level way to document a parameter — as documentation at all, since it only looked for a docstring `Args:` section. Both fixed.
 
 A maintainer on `ha-mcp` reviewed the resulting report in detail and pushed back further, correctly: the param-docs check still missed descriptions reached through a shared, cross-file type alias (`Annotated[..., Field(description=...)]` assigned to a name and imported elsewhere) and prose under non-`Args:` headings (e.g. `**Parameters:**`, including bulleted `- param: ...` lines), and — more importantly — the error-handling check's own message was wrong. It claimed a missing try/except lets a raw traceback leak through the MCP transport; FastMCP's `call_tool` dispatcher actually wraps every call and converts any exception into a structured error regardless, which the pushback prompted me to verify directly against FastMCP's source. Both the alias/heading gaps and the error-handling message are now fixed — see [homeassistant-ai/ha-mcp#2324](https://github.com/homeassistant-ai/ha-mcp/issues/2324) for the full exchange.
+
+The maintainer offered to leave a follow-up issue open if it were grounded in the actual spec and FastMCP's own guidelines rather than another pass of the same heuristics. Read the [current spec's Tools page](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) end to end looking for exactly that: one concrete, checkable gap emerged — the normative **Tool Names** section (length, character set, uniqueness), which mcp-doctor didn't check at all — now added. Checked it against ha-mcp's real 88 tool names before claiming anything: all of them already comply, so this doesn't reopen anything there — it's a real gap closed for the next server that isn't as careful, not a finding to hand back.
 
 ## Known limitations
 

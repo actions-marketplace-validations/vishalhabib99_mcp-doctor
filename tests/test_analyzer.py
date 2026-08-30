@@ -275,6 +275,71 @@ def test_bold_bulleted_parameters_heading_recognized(tmp_path):
     assert "param_docs" not in checks
 
 
+def test_tool_name_violating_charset_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool(name="do thing!")
+        def do_thing() -> str:
+            \"\"\"Does a thing.\"\"\"
+            try:
+                return "ok"
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    issue = next(i for i in report.repo_issues if i.check == "tool_name" and "1-128" in i.message)
+    assert "do thing!" in issue.message
+
+
+def test_duplicate_tool_names_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool(name="dupe")
+        def a() -> str:
+            \"\"\"First.\"\"\"
+            try:
+                return "a"
+            except ValueError as e:
+                return str(e)
+
+        @mcp.tool(name="dupe")
+        def b() -> str:
+            \"\"\"Second.\"\"\"
+            try:
+                return "b"
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    issue = next(i for i in report.repo_issues if i.check == "tool_name" and "unique" in i.message)
+    assert "dupe" in issue.message
+
+
+def test_valid_tool_name_not_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    assert not any(i.check == "tool_name" for i in report.repo_issues)
+
+
 def test_missing_readme_and_license_flagged(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)

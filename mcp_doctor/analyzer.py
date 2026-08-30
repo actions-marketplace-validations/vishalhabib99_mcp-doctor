@@ -24,6 +24,11 @@ SECRET_PATTERN = re.compile(
 
 FASTMCP_DECORATOR_NAMES = {"tool"}
 
+# Spec: https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool-names
+# "Tool names SHOULD be between 1 and 128 characters... allowed characters: A-Z, a-z,
+# 0-9, _, -, . ... SHOULD NOT contain spaces, commas... SHOULD be unique within a server."
+VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
 
 @dataclass
 class ToolIssue:
@@ -222,7 +227,9 @@ def _analyze_function_as_tool(
     file: str,
     description_override: str | None = None,
     alias_registry: dict[str, bool] | None = None,
+    name_override: str | None = None,
 ) -> ToolFinding:
+    tool_name = name_override or fn.name
     docstring = ast.get_docstring(fn)
     description = description_override or (docstring.splitlines()[0].strip() if docstring else "")
     all_args = fn.args.args
@@ -239,7 +246,7 @@ def _analyze_function_as_tool(
     has_try, has_bare = _contains_try_except(fn)
 
     finding = ToolFinding(
-        name=fn.name,
+        name=tool_name,
         file=file,
         line=fn.lineno,
         has_description=bool(description.strip()),
@@ -253,27 +260,27 @@ def _analyze_function_as_tool(
 
     if not finding.has_description:
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "description",
+            tool_name, file, fn.lineno, "description",
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
     elif finding.description_len < 10:
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "description",
+            tool_name, file, fn.lineno, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
             "warning",
         ))
 
     if args and typed < len(args):
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "types",
+            tool_name, file, fn.lineno, "types",
             f"{len(args) - typed}/{len(args)} parameters have no type annotation.",
             "warning",
         ))
 
     if args and not finding.has_docstring_params:
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "param_docs",
+            tool_name, file, fn.lineno, "param_docs",
             "Parameters aren't documented — no Args: docstring section and no per-parameter "
             "Field(description=...) — the model only sees names, not intent.",
             "warning",
@@ -281,7 +288,7 @@ def _analyze_function_as_tool(
 
     if not has_try:
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "error_handling",
+            tool_name, file, fn.lineno, "error_handling",
             "No try/except in this function's own body. FastMCP still catches an unhandled "
             "exception here and returns a structured error rather than a raw traceback, but "
             "the model only sees the generic exception text — a tool-level catch that raises "
@@ -292,7 +299,7 @@ def _analyze_function_as_tool(
         ))
     if has_bare:
         finding.issues.append(ToolIssue(
-            fn.name, file, fn.lineno, "bare_except",
+            tool_name, file, fn.lineno, "bare_except",
             "Bare 'except:' swallows all errors including cancellation — catch specific exceptions.",
             "error",
         ))
@@ -315,7 +322,8 @@ def _find_fastmcp_tools(tree: ast.Module, file: str, alias_registry: dict[str, b
                 findings.append(_analyze_function_as_tool(node, file, alias_registry=alias_registry))
                 break
             description_override = _kwarg_str(call, "description")
-            findings.append(_analyze_function_as_tool(node, file, description_override, alias_registry))
+            name_override = _kwarg_str(call, "name")
+            findings.append(_analyze_function_as_tool(node, file, description_override, alias_registry, name_override))
             break
     return findings
 
@@ -455,6 +463,28 @@ def analyze_repo(root: Path) -> Report:
 
     repo_issues: list[RepoIssue] = []
 
+    invalid_names = sorted({t.name for t in tools if not VALID_TOOL_NAME.match(t.name)})
+    if invalid_names:
+        repo_issues.append(RepoIssue(
+            "tool_name",
+            f"{len(invalid_names)} tool name(s) violate the spec's Tool Names guidance "
+            f"(1-128 chars; only A-Z a-z 0-9 _ - .): {', '.join(invalid_names[:5])}"
+            + ("…" if len(invalid_names) > 5 else ""),
+            "warning",
+        ))
+    seen: dict[str, int] = {}
+    for t in tools:
+        seen[t.name] = seen.get(t.name, 0) + 1
+    duplicate_names = sorted(n for n, count in seen.items() if count > 1)
+    if duplicate_names:
+        repo_issues.append(RepoIssue(
+            "tool_name",
+            f"{len(duplicate_names)} tool name(s) are declared more than once, violating the "
+            f"spec's 'SHOULD be unique within a server' guidance: {', '.join(duplicate_names[:5])}"
+            + ("…" if len(duplicate_names) > 5 else ""),
+            "warning",
+        ))
+
     if unparseable:
         repo_issues.append(RepoIssue(
             "parse_error",
@@ -530,6 +560,8 @@ def analyze_repo(root: Path) -> Report:
     for i in repo_issues:
         if i.check in ("secrets", "parse_error"):
             score -= 5
+        elif i.check == "tool_name":
+            score -= 2
 
     score = max(0, score)
     max_score = max(max_score, 1)
