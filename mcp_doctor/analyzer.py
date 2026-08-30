@@ -224,7 +224,12 @@ def _analyze_function_as_tool(fn: ast.FunctionDef | ast.AsyncFunctionDef, file: 
     if not has_try:
         finding.issues.append(ToolIssue(
             fn.name, file, fn.lineno, "error_handling",
-            "No try/except — an exception here will raise a raw traceback back through the MCP transport.",
+            "No try/except in this function's own body. FastMCP still catches an unhandled "
+            "exception here and returns a structured error rather than a raw traceback, but "
+            "the model only sees the generic exception text — a tool-level catch that raises "
+            "a specific, actionable message gives the model something it can act on. (If this "
+            "tool delegates its real work to a helper function that already has its own "
+            "try/except, this is a false positive — see Known Limitations.)",
             "warning",
         ))
     if has_bare:

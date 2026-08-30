@@ -73,7 +73,7 @@ mcp-doctor . --fail-under 80      # exit 1 if score drops below 80% — wire int
 | Description isn't trivially short | A 3-character description is functionally the same as none. |
 | Parameters are type-annotated | Untyped params usually mean the schema exposed to the model is untyped too. |
 | Parameters are documented (`Args:` section, or schema `description` fields) | The model sees parameter names but not intent unless you spell it out. |
-| Has error handling | An unhandled exception in a tool call surfaces as a raw traceback through the MCP transport instead of a usable error message. |
+| Has error handling | FastMCP catches an unhandled exception and returns a structured error either way — this check is about message quality, not transport safety: a tool-level catch can raise a specific, actionable message instead of leaving the model with generic exception text. |
 | No bare `except:` | Swallows everything, including cancellation — a real production bug pattern, not just a style nit. |
 
 **Repo-level:**
@@ -91,13 +91,17 @@ Run against three servers from the official [`modelcontextprotocol/servers`](htt
 - **`src/fetch`** — **100% / A**. Clean.
 - **`src/git`**, **`src/time`** — flagged as **parse errors**, not false passes. Both use Python `match` statements (3.10+ syntax); `mcp-doctor`'s AST parser follows the grammar of whatever Python interpreter runs it, so under Python 3.9 those files can't be parsed. Rather than silently skip them and report a misleadingly clean score, `mcp-doctor` surfaces this as an explicit error: *"N file(s) could not be parsed and were skipped."* Run it under Python ≥3.10 to analyze those files correctly.
 
-Later spot-checked against 4 more real, in-the-wild servers (awslabs' `aws-documentation-mcp-server`, `mcp-google-ads`, `sv-excel-agent`, and Home Assistant's `ha-mcp`, a 101-tool server). That run caught a real precision bug in the secret scanner: it was flagging test fixtures and identifier-style constant names (`SERVICE_GET_CALLER_TOKEN = "get_caller_token"`) as hardcoded credentials, dragging `ha-mcp`'s score from what should have been a B down to an F. Fixed by excluding test files/dirs and requiring a digit in the matched value — `ha-mcp` now correctly scores 84%/B instead of 55%/F.
+Later spot-checked against 4 more real, in-the-wild servers (awslabs' `aws-documentation-mcp-server`, `mcp-google-ads`, `sv-excel-agent`, and Home Assistant's `ha-mcp`, an 88-tool server). That run caught two real precision bugs: the secret scanner was flagging test fixtures and identifier-style constant names (`SERVICE_GET_CALLER_TOKEN = "get_caller_token"`) as hardcoded credentials, and the param-docs check didn't recognize `Annotated[T, Field(description=...)]` — a completely valid, schema-level way to document a parameter — as documentation at all, since it only looked for a docstring `Args:` section. Both fixed.
+
+A maintainer on `ha-mcp` reviewed the resulting report in detail and pushed back further, correctly: the param-docs check still missed descriptions reached through a shared type alias and prose under non-`Args:` headings (e.g. `**Parameters:**`), and — more importantly — the error-handling check's own message was wrong. It claimed a missing try/except lets a raw traceback leak through the MCP transport; FastMCP's `call_tool` dispatcher actually wraps every call and converts any exception into a structured error regardless, which the pushback prompted me to verify directly against FastMCP's source. The check's message is now corrected to describe what's actually at stake (message quality, not transport safety) — see [homeassistant-ai/ha-mcp#2324](https://github.com/homeassistant-ai/ha-mcp/issues/2324) for the full exchange. The type-alias and non-`Args:`-heading gaps are still open — see Known Limitations.
 
 ## Known limitations
 
 - **Python only.** No TypeScript/JS support yet, despite that being a large share of the MCP server ecosystem — see [Roadmap](#roadmap).
 - **AST-based, single-pass.** Tools constructed dynamically in a loop, or schemas built from something other than a dict literal or a `pydantic` `model_json_schema()` call, won't be fully introspected — you'll get the tool detected but a blind spot on its parameter-level checks rather than a false failure.
 - **Parses with the running interpreter's grammar.** See the spot check above — run under a Python version that matches or exceeds the syntax used in the server you're auditing.
+- **Doesn't follow delegation.** If a `@mcp.tool()` function immediately hands off to a helper (`return await do_the_real_work(...)`) that has its own try/except, the error-handling check only looks at the decorated function's own body and reports a false positive — it has no call-graph analysis.
+- **Misses aliased `Field` descriptions and non-`Args:` docstring headings.** A parameter documented via a shared `Annotated[..., Field(description=...)]` type alias rather than inline, or via a `**Parameters:**`-style markdown heading instead of a literal `Args:`/`Parameters:` line, is currently still reported as undocumented. Known gap, not yet fixed.
 
 ## Roadmap
 
