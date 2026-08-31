@@ -148,6 +148,24 @@ def test_secret_pattern_in_test_file_is_not_flagged(tmp_path):
     assert not any(i.check == "secrets" for i in report.repo_issues)
 
 
+def test_secret_pattern_in_js_test_file_is_not_flagged(tmp_path):
+    write(tmp_path, "server.py", "x = 1\n")
+    write(tmp_path, "client.test.ts", """
+        const apiKey = "ctx7sk-abcdefghijklmnopqrstuvwx";
+        """)
+    report = analyze_repo(tmp_path)
+    assert not any(i.check == "secrets" for i in report.repo_issues)
+
+
+def test_secret_pattern_in_spec_file_is_not_flagged(tmp_path):
+    write(tmp_path, "server.py", "x = 1\n")
+    write(tmp_path, "client.spec.js", """
+        const apiKey = "sk-abcdefghijklmnopqrstuvwx";
+        """)
+    report = analyze_repo(tmp_path)
+    assert not any(i.check == "secrets" for i in report.repo_issues)
+
+
 def test_tool_defined_in_test_file_is_not_counted(tmp_path):
     write(tmp_path, "server.py", """
         from mcp.server.fastmcp import FastMCP

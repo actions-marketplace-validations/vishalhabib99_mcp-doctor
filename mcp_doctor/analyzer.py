@@ -397,9 +397,14 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
     return findings
 
 
+_JS_TEST_SUFFIXES = (".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")
+
+
 def _is_test_file(path: Path) -> bool:
     name = path.name
     if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if name.endswith(_JS_TEST_SUFFIXES):
         return True
     return any(part in ("test", "tests") for part in path.parts)
 
