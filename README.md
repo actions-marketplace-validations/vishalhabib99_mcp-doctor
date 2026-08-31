@@ -41,10 +41,10 @@ Score: 100%  Grade: A  (1 tool(s) found)
 ## Install
 
 ```bash
-pip install mcpdoctor
+pip install mcp-server-lint
 ```
 
-(The PyPI project is named `mcpdoctor` — `mcp-doctor` was already taken by an unrelated package — but the installed command is still `mcp-doctor`.)
+(The PyPI project is named `mcp-server-lint` — `mcp-doctor` and every close variant of it were already taken or blocked by PyPI's anti-typosquat check — but the installed command is still `mcp-doctor`.)
 
 Or install straight from the repo:
 
