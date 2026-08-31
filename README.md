@@ -130,9 +130,9 @@ The maintainer offered to leave a follow-up issue open if it were grounded in th
 ## Roadmap
 
 - [x] TypeScript/JS server support (the official SDK's dominant language) — `registerTool`/`tool` styles, same-file const resolution
-- [ ] Publish to PyPI
+- [x] Publish to PyPI
+- [x] GitHub Action for one-line CI integration
 - [ ] `--fix` for the mechanical stuff (stub `Args:` sections, wrap in try/except)
-- [ ] GitHub Action for one-line CI integration
 
 ## Contributing
 
