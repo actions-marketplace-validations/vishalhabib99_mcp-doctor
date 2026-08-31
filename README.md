@@ -40,7 +40,13 @@ Score: 100%  Grade: A  (1 tool(s) found)
 
 ## Install
 
-Not on PyPI yet — install straight from the repo:
+```bash
+pip install mcpdoctor
+```
+
+(The PyPI project is named `mcpdoctor` — `mcp-doctor` was already taken by an unrelated package — but the installed command is still `mcp-doctor`.)
+
+Or install straight from the repo:
 
 ```bash
 pip install git+https://github.com/vishalhabib99/mcp-doctor.git

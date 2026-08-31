@@ -1,5 +1,5 @@
 [project]
-name = "mcp-doctor"
+name = "mcpdoctor"
 version = "0.2.0"
 description = "Static analysis CLI that audits MCP (Model Context Protocol) server implementations for spec conformance and quality issues."
 readme = "README.md"
