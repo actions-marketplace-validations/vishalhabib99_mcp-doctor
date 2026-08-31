@@ -63,6 +63,20 @@ mcp-doctor . --json               # machine-readable output
 mcp-doctor . --fail-under 80      # exit 1 if score drops below 80% — wire into CI
 ```
 
+## GitHub Action
+
+Gate PRs on server quality without installing anything yourself:
+
+```yaml
+- uses: vishalhabib99/mcp-doctor@main
+  with:
+    path: .              # default: repo root
+    fail-under: 70        # default: 0 (report only, don't fail the build)
+    comment: true          # default: true — posts/updates a PR comment with the report
+```
+
+The report also gets written to the job summary either way. Pin `version:` to a tag or commit instead of `@main` once a release exists, for reproducible builds.
+
 ## What it checks
 
 Audits both Python and TypeScript/JavaScript servers in the same repo. Python detects the FastMCP `@mcp.tool()` decorator style and the low-level SDK's `Tool(name=..., description=..., inputSchema=...)` style; TS/JS detects the official SDK's `server.registerTool(name, config, handler)` and `server.tool(name, description, schema, handler)` styles, including the common pattern where the config object or Zod schema is a same-file `const` reference rather than inline. The same checks apply either way — a description, per-parameter docs (`Args:`/`Field(description=...)` in Python, `.describe(...)` on each Zod field in TS), and a try/except (or try/catch).

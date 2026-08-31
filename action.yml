@@ -1,0 +1,100 @@
+name: "mcp-doctor"
+description: "Audit an MCP server implementation for spec conformance and quality issues, and gate PRs on the score."
+author: "Vishal Habib"
+branding:
+  icon: "activity"
+  color: "purple"
+
+inputs:
+  path:
+    description: "Path to the repo/server to audit, relative to the checkout."
+    required: false
+    default: "."
+  fail-under:
+    description: "Fail the workflow if the score percent is below this threshold. 0 disables gating."
+    required: false
+    default: "0"
+  comment:
+    description: "Post the report as a comment on the triggering pull request."
+    required: false
+    default: "true"
+  version:
+    description: "Git ref of mcp-doctor to install (branch, tag, or commit)."
+    required: false
+    default: "main"
+
+outputs:
+  score:
+    description: "Score percent (0-100)."
+    value: ${{ steps.audit.outputs.score }}
+  grade:
+    description: "Letter grade (A-F)."
+    value: ${{ steps.audit.outputs.grade }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install mcp-doctor
+      shell: bash
+      run: pip install "git+https://github.com/vishalhabib99/mcp-doctor.git@${{ inputs.version }}"
+
+    - name: Run audit
+      id: audit
+      shell: bash
+      run: |
+        set +e
+        mcp-doctor "${{ inputs.path }}" --no-color > mcp-doctor-report.txt
+        text_status=$?
+        mcp-doctor "${{ inputs.path }}" --json > mcp-doctor-report.json
+        set -e
+
+        score=$(python -c "import json;print(json.load(open('mcp-doctor-report.json'))['percent'])")
+        grade=$(python -c "import json;print(json.load(open('mcp-doctor-report.json'))['grade'])")
+        echo "score=$score" >> "$GITHUB_OUTPUT"
+        echo "grade=$grade" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## mcp-doctor report"
+          echo '```'
+          cat mcp-doctor-report.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        fail_under="${{ inputs.fail-under }}"
+        if [ "$fail_under" != "0" ] && [ "$score" -lt "$fail_under" ]; then
+          echo "::error::mcp-doctor score $score% is below the required $fail_under%"
+          echo "gate_failed=1" >> "$GITHUB_OUTPUT"
+        else
+          echo "gate_failed=0" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Comment on pull request
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        {
+          echo "### mcp-doctor report — Score: ${{ steps.audit.outputs.score }}% (${{ steps.audit.outputs.grade }})"
+          echo
+          echo '```'
+          cat mcp-doctor-report.txt
+          echo '```'
+        } > mcp-doctor-comment.md
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file mcp-doctor-comment.md \
+          --edit-last || \
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file mcp-doctor-comment.md
+
+    - name: Enforce score gate
+      if: ${{ steps.audit.outputs.gate_failed == '1' }}
+      shell: bash
+      run: exit 1
