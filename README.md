@@ -69,7 +69,10 @@ mcp-doctor .                      # audit the current directory
 mcp-doctor path/to/server         # audit a specific path
 mcp-doctor . --json               # machine-readable output
 mcp-doctor . --fail-under 80      # exit 1 if score drops below 80% — wire into CI
+mcp-doctor . --fix                # apply safe, mechanical fixes in place, then re-report
 ```
+
+`--fix` only touches what's safe to fix without human judgment: narrowing a bare `except:` to `except Exception:`, and stubbing an `Args:` docstring section (with `TODO: describe this parameter.` placeholders) for a tool whose params have *no* documentation at all. It never fabricates a missing description, guesses at types, wraps a function body in try/except, or touches a docstring that already documents some but not all of its params — those still need a human.
 
 ## GitHub Action
 
@@ -128,13 +131,14 @@ The maintainer offered to leave a follow-up issue open if it were grounded in th
 - **Parses with the running interpreter's grammar (Python side).** See the spot check above — run under a Python version that matches or exceeds the syntax used in the server you're auditing.
 - **Doesn't follow delegation.** If a tool function immediately hands off to a helper that has its own try/except (or try/catch), the error-handling check only looks at the decorated function's own body and reports a false positive — it has no call-graph analysis.
 - **TS/JS const resolution is same-file only.** Unlike the Python side's cross-file `Field` type-alias resolution, a TS config object or Zod schema referenced via an import from another file won't be resolved — only same-file `const` references.
+- **`--fix` only fixes the fully-undocumented case, Python only.** If a docstring already documents *some* params but not all, `--fix` leaves it alone rather than risk merging into it incorrectly — you'll still see the warning, just not an auto-stub. TS/JS files aren't touched by `--fix` at all yet.
 
 ## Roadmap
 
 - [x] TypeScript/JS server support (the official SDK's dominant language) — `registerTool`/`tool` styles, same-file const resolution
 - [x] Publish to PyPI
 - [x] GitHub Action for one-line CI integration
-- [ ] `--fix` for the mechanical stuff (stub `Args:` sections, wrap in try/except)
+- [x] `--fix` for the genuinely mechanical stuff (bare `except:`, fully-undocumented `Args:` stubs) — deliberately does *not* auto-wrap function bodies in try/except; generating a correct wrapper for arbitrary code (preserving return semantics, control flow) needs more judgment than a mechanical pass should take on
 
 ## Contributing
 

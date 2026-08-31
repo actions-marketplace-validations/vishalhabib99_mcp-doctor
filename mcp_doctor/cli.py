@@ -22,6 +22,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Exit with status 1 if score percent is below this threshold (for CI)",
     )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Apply safe, mechanical fixes in place (bare except, missing Args: stubs), then re-report",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.path).resolve()
@@ -30,6 +35,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     report = analyze_repo(root)
+
+    if args.fix:
+        from .fix import apply_fixes
+
+        changed = apply_fixes(root, report)
+        if changed:
+            print(f"Fixed {len(changed)} file(s): {', '.join(changed)}", file=sys.stderr)
+            report = analyze_repo(root)
+        else:
+            print("Nothing to fix.", file=sys.stderr)
 
     if args.json:
         print(render_json(report))
