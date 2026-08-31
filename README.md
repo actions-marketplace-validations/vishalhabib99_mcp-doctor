@@ -68,14 +68,14 @@ mcp-doctor . --fail-under 80      # exit 1 if score drops below 80% — wire int
 Gate PRs on server quality without installing anything yourself:
 
 ```yaml
-- uses: vishalhabib99/mcp-doctor@main
+- uses: vishalhabib99/mcp-doctor@v1
   with:
     path: .              # default: repo root
     fail-under: 70        # default: 0 (report only, don't fail the build)
     comment: true          # default: true — posts/updates a PR comment with the report
 ```
 
-The report also gets written to the job summary either way. Pin `version:` to a tag or commit instead of `@main` once a release exists, for reproducible builds.
+The report also gets written to the job summary either way. `@v1` tracks the latest `v1.x` release; pin an exact tag or commit SHA instead if you need stricter reproducibility.
 
 ## What it checks
 
