@@ -95,6 +95,73 @@ def test_dynamic_tool_name_is_skipped_not_crashed(tmp_path):
     assert findings == []
 
 
+def test_fastmcp_add_tool_single_object_style(tmp_path):
+    write(tmp_path, "server.ts", """
+        import { z } from "zod";
+
+        server.addTool({
+          name: "firecrawl_scrape",
+          annotations: { title: "Scrape a URL", readOnlyHint: true },
+          description: "Retrieve and extract content from one supplied URL.",
+          parameters: z.object({
+            url: z.string().describe("The URL to scrape"),
+            maxAge: z.number().describe("Cache age in ms"),
+          }),
+          execute: async (args, { session, log }) => {
+            log.info("scraping", { url: args.url });
+            return String(args.url);
+          },
+        });
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    assert len(findings) == 1
+    tool = findings[0]
+    assert tool.name == "firecrawl_scrape"
+    checks = {i.check for i in tool.issues}
+    assert "description" not in checks
+    assert "param_docs" not in checks
+    assert "error_handling" in checks  # no try/catch in execute
+
+
+def test_fastmcp_add_tool_with_const_schema_and_missing_docs(tmp_path):
+    write(tmp_path, "server.ts", """
+        import { z } from "zod";
+
+        const MapSchema = z.object({
+          search: z.string(),
+        });
+
+        server.addTool({
+          name: "firecrawl_map",
+          description: "",
+          parameters: MapSchema,
+          execute: async (args) => {
+            try {
+              return String(args.search);
+            } catch (e) {
+              throw e;
+            }
+          },
+        });
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    tool = findings[0]
+    checks = {i.check for i in tool.issues}
+    assert "description" in checks
+    assert "param_docs" in checks  # search has no .describe(...)
+    assert "error_handling" not in checks
+
+
+def test_add_tool_dynamic_config_is_skipped_not_crashed(tmp_path):
+    write(tmp_path, "server.ts", """
+        for (const t of tools) {
+          registrar.addTool(t);
+        }
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    assert findings == []
+
+
 def test_analyze_repo_includes_ts_tools(tmp_path):
     write(tmp_path, "server.ts", """
         server.registerTool("x", { description: "Does x thing", inputSchema: z.object({}) }, async () => {

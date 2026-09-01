@@ -1,10 +1,12 @@
 """Static analysis of TypeScript/JavaScript MCP server implementations.
 
 Mirrors analyzer.py's checks (description, per-parameter docs, error handling)
-for the official TS SDK's two registration styles:
+for the official TS SDK's two registration styles, plus the community
+`fastmcp` (punkpeye/fastmcp) package's single-object style:
 
     server.registerTool(name, { description, inputSchema: ZodObjectOrConst }, handler)
     server.tool(name, description, zodShapeOrConst, handler)
+    server.addTool({ name, description, parameters: ZodObjectOrConst, execute })
 
 Both the config object and the Zod schema are commonly a same-file `const`
 reference rather than an inline literal (see the official `everything`
@@ -29,6 +31,8 @@ except ImportError:  # pragma: no cover - exercised via TS_AVAILABLE branch
     TS_AVAILABLE = False
 
 REGISTER_METHODS = {"registerTool", "tool"}
+# fastmcp's single-object style: server.addTool({ name, description, parameters, execute })
+SINGLE_OBJECT_METHODS = {"addTool"}
 
 
 def _text(node, src: bytes) -> str:
@@ -157,8 +161,11 @@ def _analyze_ts_tool(
     if config_or_desc is not None and config_or_desc.type == "object":
         pairs = _object_pairs(config_or_desc, src)
         description = _string_value(pairs.get("description"), src) or ""
-        if schema_arg is None and "inputSchema" in pairs:
-            schema_arg = _resolve(pairs["inputSchema"], consts)
+        if schema_arg is None:
+            # registerTool uses inputSchema; fastmcp's addTool uses parameters.
+            schema_key = pairs.get("inputSchema") or pairs.get("parameters")
+            if schema_key is not None:
+                schema_arg = _resolve(schema_key, consts)
     else:
         description = _string_value(config_or_desc, src) or ""
 
@@ -256,12 +263,32 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
             if node.type != "call_expression":
                 continue
             method = _callee_name(node)
-            if method not in REGISTER_METHODS:
+            if method not in REGISTER_METHODS and method not in SINGLE_OBJECT_METHODS:
                 continue
             args_node = node.child_by_field_name("arguments")
             if args_node is None:
                 continue
             arg_nodes = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+
+            if method in SINGLE_OBJECT_METHODS:
+                if len(arg_nodes) != 1:
+                    continue
+                config = _resolve(arg_nodes[0], consts)
+                if config.type != "object":
+                    continue
+                pairs = _object_pairs(config, src)
+                name_val = _string_value(_resolve(pairs.get("name"), consts), src)
+                if name_val is None:
+                    continue  # dynamic tool name — can't attribute a finding to it
+                handler_val = pairs.get("execute")
+                handler = handler_val if handler_val is not None and handler_val.type in (
+                    "arrow_function", "function_expression"
+                ) else None
+                findings.append(
+                    _analyze_ts_tool(name_val, config, None, handler, consts, src, rel, node.start_point[0] + 1)
+                )
+                continue
+
             if len(arg_nodes) < 3:
                 continue
             name_val = _string_value(_resolve(arg_nodes[0], consts), src)
