@@ -450,6 +450,14 @@ def _kwarg_bool(call: ast.Call, *keys: str) -> bool | None:
     return None
 
 
+def _kwarg_present(call: ast.Call, *keys: str) -> bool:
+    """Whether any of `keys` was passed at all, regardless of its value —
+    for a field like `destructiveHint` whose *presence* is the thing that
+    matters (the spec defines it as meaningful only when `readOnlyHint` is
+    false, not any particular value of it)."""
+    return any(kw.arg in keys for kw in call.keywords)
+
+
 def _contains_try_except(node: ast.AST) -> tuple[bool, bool]:
     has_try = False
     has_bare = False
@@ -598,6 +606,7 @@ def _analyze_function_as_tool(
     excluded_arg_names: set[str] | None = None,
     error_handling_registry: dict[str, bool] | None = None,
     declared_read_only: bool | None = None,
+    declared_destructive_present: bool = False,
 ) -> ToolFinding:
     tool_name = name_override or fn.name
     docstring = ast.get_docstring(fn)
@@ -709,6 +718,16 @@ def _analyze_function_as_tool(
                 "action that isn't actually read-only. Heuristic — worth a human look, not confirmed.",
                 "warning", "security",
             ))
+        if declared_destructive_present:
+            finding.issues.append(ToolIssue(
+                tool_name, file, fn.lineno, "annotation_contradiction",
+                "Declared readOnlyHint: true and also set destructiveHint — the spec defines "
+                "destructiveHint as meaningful only when readOnlyHint is false, so this combination "
+                "is self-contradictory and destructiveHint's value here has no defined meaning. "
+                "Common when a new tool is cloned from an existing write-tool's annotation block and "
+                "only readOnlyHint gets flipped to true.",
+                "warning", "security",
+            ))
 
     return finding
 
@@ -742,9 +761,14 @@ def _find_fastmcp_tools(
                 _kwarg_bool(annotations_call, "read_only_hint", "readOnlyHint")
                 if annotations_call is not None else None
             )
+            declared_destructive_present = (
+                _kwarg_present(annotations_call, "destructive_hint", "destructiveHint")
+                if annotations_call is not None else False
+            )
             findings.append(_analyze_function_as_tool(
                 node, file, description_override, alias_registry, name_override,
                 excluded_args, error_handling_registry, declared_read_only,
+                declared_destructive_present,
             ))
             break
     return findings

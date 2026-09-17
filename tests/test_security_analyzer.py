@@ -633,6 +633,101 @@ def test_annotation_mismatch_penalizes_security_score_not_quality(tmp_path):
     assert report.security_percent < 100
 
 
+def test_read_only_and_destructive_hint_together_flags_contradiction(tmp_path):
+    # Reported by Christian Bru (modelcontextprotocol/modelcontextprotocol
+    # discussion #3322): the spec's own doc comment on destructiveHint says
+    # it's "meaningful only when readOnlyHint == false" (schema.ts,
+    # ToolAnnotations), but nothing in the JSON Schema enforces that — a
+    # copy-paste from an existing write-tool's annotation block, with only
+    # readOnlyHint flipped to true, silently leaves a stale destructiveHint.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from mcp.types import ToolAnnotations
+        mcp = FastMCP("x")
+
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=True))
+        def get_status(record_id: str) -> str:
+            \"\"\"Args:
+                record_id: the record to check.
+            \"\"\"
+            return cursor.execute(f"SELECT status FROM records WHERE id = '{record_id}'").fetchone()
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "get_status")
+    contradiction = next(i for i in tool.issues if i.check == "annotation_contradiction")
+    assert contradiction.category == "security"
+
+
+def test_read_only_and_destructive_hint_false_still_flags_contradiction(tmp_path):
+    # The property has no defined meaning at all when readOnlyHint is true —
+    # not "no defined meaning unless true" — so an explicit destructiveHint:
+    # false is just as contradictory as true, and camelCase (the spec's own
+    # spelling, as an SDK consumer would actually write it) must be read too.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from mcp.types import ToolAnnotations
+        mcp = FastMCP("x")
+
+        @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
+        def get_status(record_id: str) -> str:
+            \"\"\"Args:
+                record_id: the record to check.
+            \"\"\"
+            return cursor.execute(f"SELECT status FROM records WHERE id = '{record_id}'").fetchone()
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "get_status")
+    assert any(i.check == "annotation_contradiction" for i in tool.issues)
+
+
+def test_read_only_alone_does_not_flag_contradiction(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from mcp.types import ToolAnnotations
+        mcp = FastMCP("x")
+
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+        def get_status(record_id: str) -> str:
+            \"\"\"Args:
+                record_id: the record to check.
+            \"\"\"
+            return cursor.execute(f"SELECT status FROM records WHERE id = '{record_id}'").fetchone()
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "get_status")
+    assert not any(i.check == "annotation_contradiction" for i in tool.issues)
+
+
+def test_destructive_hint_without_read_only_does_not_flag_contradiction(tmp_path):
+    # destructiveHint is well-defined on its own (or alongside
+    # readOnlyHint: false) — the contradiction only exists relative to an
+    # explicit readOnlyHint: true.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from mcp.types import ToolAnnotations
+        mcp = FastMCP("x")
+
+        @mcp.tool(annotations=ToolAnnotations(destructive_hint=True))
+        def archive_record(record_id: str) -> str:
+            \"\"\"Args:
+                record_id: the record to archive.
+            \"\"\"
+            cursor.execute(f"UPDATE records SET archived = 1 WHERE id = '{record_id}'")
+            return "archived"
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "archive_record")
+    assert not any(i.check == "annotation_contradiction" for i in tool.issues)
+
+
 def test_bare_requirements_line_is_flagged_unpinned(tmp_path):
     from mcp_doctor.security import scan_unpinned_dependencies
 
