@@ -113,6 +113,24 @@ The report also gets written to the job summary either way. `@v1` tracks the lat
 
 Want mcp-fuzz's runtime resilience checks and mcp-reality-check's output-fidelity checks in the same PR check, not just this one? [`mcp-trust-check`](https://github.com/vishalhabib99/mcp-trust-check) wraps all three behind a single Action and one combined score.
 
+## Runtime gate — the same two checks, applied to live `tools/list` metadata
+
+Unlike its two siblings (`mcp-fuzz`, `mcp-reality-check`), which already connect to a real server to run their checks, `mcp-doctor` has never made a live call to anything — it only ever reads source. `check_tool_registration` keeps that true: it's a pure function over tool metadata your own MCP client already fetched, not a connection of its own. No new dependency, no `mcp` package required.
+
+```python
+from mcp_doctor.gate import check_tool_registration
+
+# tools = (await session.list_tools()).tools, from your own client
+for tool in tools:
+    result = check_tool_registration(tool.name, tool.description, tool.annotations)
+    if result.flagged:
+        ...  # missing/vague description, or a real readOnlyHint/destructiveHint conflict
+```
+
+Narrower than the full static analyzer, honestly: the read-only/mutation-signal-mismatch check (does a tool's own code actually write despite claiming `readOnlyHint: true`) has no live counterpart — an agent discovering tools at runtime has no access to server source, only what the server declares about itself. What's checkable from declared metadata alone: description quality, and whether a tool's own annotations are internally consistent.
+
+**The annotation-contradiction rule here is deliberately not a direct port of the static check.** Dogfooding against the real official `@modelcontextprotocol/server-memory` reference server, before this ever shipped, found the static check's rule — flag `destructiveHint` merely being *present* alongside `readOnlyHint: true`, regardless of its value — miscalibrated for live data: that server explicitly declares all four `ToolAnnotations` fields on every tool as a matter of good, complete practice (`read_graph`: `readOnlyHint=true, destructiveHint=false` — sensible and consistent), which the presence-only rule flagged as contradictory anyway. Presence is a fair proxy for "copy-paste leftover" in source code, where an author who didn't think about a field usually doesn't write it; at the wire level, a careful implementer setting every field explicitly is common, not a bug. Fixed before shipping: the live check requires `destructiveHint` to actually be `true`, not merely set, alongside `readOnlyHint: true` — re-verified clean (0/9 false positives) against the same reference server afterward.
+
 ## What it checks
 
 Audits Python, TypeScript/JavaScript, and Go servers in the same repo. Python detects the FastMCP `@mcp.tool()` decorator style and the low-level SDK's `Tool(name=..., description=..., inputSchema=...)` style; TS/JS detects the official SDK's `server.registerTool(name, config, handler)` and `server.tool(name, description, schema, handler)` styles, including the common pattern where the config object or Zod schema is a same-file `const` reference rather than inline; Go detects the official `modelcontextprotocol/go-sdk`'s generic `mcp.AddTool(server, &mcp.Tool{...}, handler)` (checking parameters documented either via an explicit `InputSchema` or via `json`/`jsonschema` struct tags on the handler's argument type — the SDK's own schema-inference convention) and `mark3labs/mcp-go`'s older `s.AddTool(mcp.NewTool(name, mcp.WithDescription(...), mcp.WithString(...)), handler)` fluent-builder style, where every parameter is declared inline. The same checks apply across languages — a description and per-parameter docs (`Args:`/`Field(description=...)` in Python, `.describe(...)` on each Zod field in TS, a `jsonschema:"..."` struct tag or `mcp.Description(...)` builder call in Go) — except error handling, which isn't checked for Go (see Known limitations: Go's failure model is different enough from Python/TS exceptions that a naive port risked being wrong, not just incomplete).
