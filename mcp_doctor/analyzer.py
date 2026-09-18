@@ -259,6 +259,83 @@ def _param_documented_via_field(
     return _field_call_has_description(default) if default is not None else False
 
 
+def _is_url_param_name(name: str) -> bool:
+    """Name-based, like every other heuristic in this module: `url`/`icon_url`/
+    `target_url` match (the token appears between underscores or at either
+    end), `curl`/`hourly` don't (the token has to be a whole underscore-
+    separated component, not a substring)."""
+    tokens = name.lower().split("_")
+    return "url" in tokens or "uri" in tokens
+
+
+def _annotation_is_str_like(annotation: ast.expr | None) -> bool:
+    """Whether a parameter's annotation resolves to `str`, unwrapping
+    `str | None`, `Optional[str]`, `Union[str, ...]`, and `Annotated[str, ...]`
+    — the same shapes `_annotation_is_str_like`'s callers care about, since a
+    URL-shaped schema hint only makes sense on a string field."""
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Name):
+        return annotation.id == "str"
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return _annotation_is_str_like(annotation.left) or _annotation_is_str_like(annotation.right)
+    if isinstance(annotation, ast.Subscript):
+        base_name = _annotation_base_name(annotation.value)
+        if base_name == "Optional":
+            return _annotation_is_str_like(annotation.slice)
+        if base_name == "Union":
+            elts = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+            return any(_annotation_is_str_like(e) for e in elts)
+        if base_name == "Annotated":
+            sl = annotation.slice
+            elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+            return bool(elts) and _annotation_is_str_like(elts[0])
+    return False
+
+
+def _dict_has_str_key(d: ast.Dict, key: str) -> bool:
+    return any(isinstance(k, ast.Constant) and k.value == key for k in d.keys)
+
+
+def _field_call_has_format_hint(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    if name != "Field":
+        return False
+    if _kwarg_present(node, "format"):
+        return True
+    extra = _kwarg_call(node, "json_schema_extra")
+    # json_schema_extra is normally a dict literal (`{"format": "uri"}`), not
+    # a call — _kwarg_call only matches ast.Call, so fetch it separately here
+    # rather than reusing that helper for a shape it wasn't built for.
+    for kw in node.keywords:
+        if kw.arg == "json_schema_extra" and isinstance(kw.value, ast.Dict):
+            if _dict_has_str_key(kw.value, "format"):
+                return True
+    return False
+
+
+def _param_has_url_format_hint(arg: ast.arg, default: ast.expr | None) -> bool:
+    """Whether a URL-shaped parameter declares a `format` schema hint —
+    `Annotated[str, Field(format="uri")]`, `Field(json_schema_extra={"format": "uri"})`,
+    or the `x: str = Field(...)` default-value spelling of either. Doesn't
+    resolve a shared type-alias the way `_param_documented_via_field` does for
+    descriptions — a repo-wide `UrlField = Annotated[str, Field(format="uri")]`
+    alias would currently still be flagged. Known limitation, not a silent gap."""
+    annotation = arg.annotation
+    if isinstance(annotation, ast.Subscript):
+        base = annotation.value
+        base_name = base.attr if isinstance(base, ast.Attribute) else (base.id if isinstance(base, ast.Name) else None)
+        if base_name == "Annotated":
+            sl = annotation.slice
+            elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+            if any(_field_call_has_format_hint(e) for e in elts[1:]):
+                return True
+    return _field_call_has_format_hint(default) if default is not None else False
+
+
 def _collect_field_aliases(tree: ast.Module, registry: dict[str, bool]) -> None:
     """Find module-level `Name = Annotated[T, Field(description=...)]` assignments
     so parameters annotated with the alias elsewhere (even in another file) are
@@ -686,6 +763,23 @@ def _analyze_function_as_tool(
             tool_name, file, fn.lineno, "param_docs",
             "Parameters aren't documented — no Args:/:param: docstring section and no per-parameter "
             "Field(description=...) — the model only sees names, not intent.",
+            "warning",
+        ))
+
+    url_params_missing_format = [
+        a.arg for a in args
+        if _is_url_param_name(a.arg)
+        and _annotation_is_str_like(a.annotation)
+        and not _param_has_url_format_hint(a, defaults_by_arg.get(a))
+    ]
+    if url_params_missing_format:
+        finding.issues.append(ToolIssue(
+            tool_name, file, fn.lineno, "url_format_hint",
+            f"{', '.join(url_params_missing_format)} looks like a URL parameter (by name) but "
+            "has no `format: \"uri\"` schema hint — a schema-only client (a fuzzer, or a strict "
+            "schema-driven agent) sees a bare string, not a URL. Add it via "
+            "`Field(json_schema_extra={\"format\": \"uri\"})`. Name-based heuristic — worth a "
+            "human look, not confirmed.",
             "warning",
         ))
 

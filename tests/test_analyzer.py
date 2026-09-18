@@ -1144,3 +1144,150 @@ def test_cli_bad_example_ts_reports_low_score():
         text=True,
     )
     assert result.returncode == 1
+
+
+def test_bare_url_param_flagged_for_missing_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(url: Annotated[str, Field(description="The bookmark URL.")]) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issue = next(i for i in tool.issues if i.check == "url_format_hint")
+    assert "url" in issue.message
+
+
+def test_icon_url_optional_str_also_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated, Optional
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def create_link(
+            icon_url: Annotated[Optional[str], Field(description="Icon URL.")] = None,
+        ) -> str:
+            \"\"\"Create a link.\"\"\"
+            try:
+                return icon_url or ""
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issue = next(i for i in tool.issues if i.check == "url_format_hint")
+    assert "icon_url" in issue.message
+
+
+def test_field_format_kwarg_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(
+            url: Annotated[str, Field(description="The bookmark URL.", format="uri")],
+        ) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_json_schema_extra_format_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(
+            url: Annotated[str, Field(description="The bookmark URL.", json_schema_extra={"format": "uri"})],
+        ) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_default_value_field_format_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(url: str = Field(description="The bookmark URL.", format="uri")) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_non_url_param_name_not_falsely_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def run_curl(curl_command: Annotated[str, Field(description="Shell command.")]) -> str:
+            \"\"\"Run a curl command.\"\"\"
+            try:
+                return curl_command
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_non_str_url_param_not_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def fetch(url: Annotated[bytes, Field(description="Encoded URL.")]) -> str:
+            \"\"\"Fetch something.\"\"\"
+            try:
+                return str(url)
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
