@@ -171,7 +171,7 @@ Scored as a **separate axis** from quality (its own percent/grade) — a repo ca
 
 ## Real-world spot check
 
-Run against 15+ real MCP servers in the wild, not just the fixtures in `examples/`. Every fix below was verified against the actual repo before/after, not just against a synthetic test case.
+Run against 40+ real MCP servers in the wild, not just the fixtures in `examples/`. Every fix below was verified against the actual repo before/after, not just against a synthetic test case.
 
 | Repo | Stars | Lang | What mcp-doctor found |
 |---|---|---|---|
