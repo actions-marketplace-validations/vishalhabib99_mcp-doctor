@@ -221,6 +221,63 @@ def test_raw_schema_tool_with_unresolvable_property_stays_a_no_op(tmp_path):
     assert compute_schema_diff(baseline, report.tools) == []
 
 
+def test_complete_baseline_vs_incomplete_current_is_not_a_false_positive(tmp_path):
+    # Reported by Edward Izgorodin (modelcontextprotocol/modelcontextprotocol
+    # discussion #3322) after the first fix above shipped: a baseline
+    # captured when every property name *was* resolvable (both "key" and
+    # "extra" present) diffed against a current run where "extra" is a
+    # dynamic dict key must not report "extra" as removed just because the
+    # current run's param_names is a known-incomplete subset.
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+        _extra_key = "extra"
+        lookup_tool = Tool(
+            name="lookup",
+            description="Look up a synthetic value.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Key to look up."},
+                    _extra_key: {"type": "string", "description": "Extra key to look up."},
+                },
+                "required": ["key", "extra"],
+            },
+        )
+        """)
+    report = analyze_repo(tmp_path)
+    assert report.tools[0].param_names_complete is False
+    baseline = _baseline([
+        {"name": "lookup", "param_names": ["key", "extra"], "required_param_names": ["key", "extra"]},
+    ])
+
+    assert compute_schema_diff(baseline, report.tools) == []
+
+
+def test_decorator_style_removal_still_caught_after_completeness_gating(tmp_path):
+    # The new param_names_complete gate only applies to the *current* run
+    # (decorator/class-based tools always resolve every arg, so it's always
+    # True there) — a real removed parameter must still be caught, and a
+    # baseline dict predating this field (no "param_names_complete" key at
+    # all) must not disable that detection.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_item() -> str:
+            \"\"\"Gets an item.\"\"\"
+            return "x"
+        """)
+    report = analyze_repo(tmp_path)
+    baseline = _baseline([
+        {"name": "get_item", "param_names": ["item_id"], "required_param_names": ["item_id"]},
+    ])
+
+    changes = compute_schema_diff(baseline, report.tools)
+    assert len(changes) == 1
+    assert changes[0].change == "param_removed"
+
+
 def test_identical_schema_produces_no_changes(tmp_path):
     write(tmp_path, "server.py", """
         from mcp.server.fastmcp import FastMCP

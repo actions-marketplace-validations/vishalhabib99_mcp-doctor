@@ -27,6 +27,16 @@ report every unchanged shared parameter as `param_removed`, because "empty"
 was silently conflated with "genuinely no parameters" instead of "coverage
 unknown" (reported by Edward Izgorodin, github.com/modelcontextprotocol/
 modelcontextprotocol#3322).
+
+That fix still leaves param_names itself an incomplete subset whenever a
+property name isn't a string literal (e.g. a variable used as a dict key) —
+a genuinely-present parameter the analyzer just couldn't attribute a name
+to. Diffing against a baseline that *did* see that name then reports it as
+"removed": a second, related false positive Edward found once the first was
+fixed. Guarded the same way required-ness already was: current.param_names
+must be a complete snapshot before a name absent from it is trusted as
+actually gone. A legacy baseline predating the `param_names_complete` field
+defaults to complete, matching its pre-existing (correct) behavior.
 """
 
 from __future__ import annotations
@@ -65,13 +75,14 @@ def compute_schema_diff(baseline: dict, current_tools: list[ToolFinding]) -> lis
         base_required = set(base_tool.get("required_param_names", []))
         current_required = set(current.required_param_names)
 
-        for removed in sorted(base_params - current_params):
-            changes.append(SchemaChange(
-                name, "param_removed",
-                f"Parameter '{removed}' existed in the baseline and is gone now — a caller "
-                "still passing it will get rejected.",
-                "error",
-            ))
+        if current.param_names_complete:
+            for removed in sorted(base_params - current_params):
+                changes.append(SchemaChange(
+                    name, "param_removed",
+                    f"Parameter '{removed}' existed in the baseline and is gone now — a caller "
+                    "still passing it will get rejected.",
+                    "error",
+                ))
 
         for newly_required in sorted(current_required - base_required):
             changes.append(SchemaChange(

@@ -80,6 +80,13 @@ class ToolFinding:
     # false positive.
     param_names: list[str] = field(default_factory=list)
     required_param_names: list[str] = field(default_factory=list)
+    # True unless a raw-schema property name couldn't be resolved to a string
+    # literal (e.g. a variable used as a dict key), in which case param_names
+    # itself is a known-incomplete subset of the tool's real parameters —
+    # schema_diff.py must not treat a name missing from an incomplete list as
+    # removed, only as "not statically visible" (reported by Edward
+    # Izgorodin, github.com/modelcontextprotocol/modelcontextprotocol#3322).
+    param_names_complete: bool = True
 
 
 @dataclass
@@ -1094,7 +1101,8 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
         # required name from an unresolved property wouldn't have a matching
         # entry in param_names, which schema_diff.py would misread as "newly
         # required" rather than "not statically visible".
-        if len(param_names) != param_count:
+        param_names_complete = len(param_names) == param_count
+        if not param_names_complete:
             required_param_names = []
 
         finding = ToolFinding(
@@ -1111,6 +1119,7 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
             description_text=description,
             param_names=param_names,
             required_param_names=required_param_names,
+            param_names_complete=param_names_complete,
         )
         if not finding.has_description:
             finding.issues.append(ToolIssue(

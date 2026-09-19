@@ -94,6 +94,7 @@ def render_json(report: Report, schema_changes: list[SchemaChange] | None = None
                 "issues": [asdict(i) for i in t.issues],
                 "param_names": t.param_names,
                 "required_param_names": t.required_param_names,
+                "param_names_complete": t.param_names_complete,
             }
             for t in report.tools
         ],
