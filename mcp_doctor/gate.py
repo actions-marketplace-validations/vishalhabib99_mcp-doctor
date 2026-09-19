@@ -42,6 +42,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .analyzer import description_display_width
+
 VAGUE_DESCRIPTION_MIN_CHARS = 10
 
 
@@ -93,7 +95,7 @@ def check_tool_registration(name: str, description: str | None, annotations=None
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif len(text) < VAGUE_DESCRIPTION_MIN_CHARS:
+    elif description_display_width(text) < VAGUE_DESCRIPTION_MIN_CHARS:
         result.issues.append(RegistrationIssue(
             "description",
             f"Description is only {len(text)} chars — likely just restates the name.",

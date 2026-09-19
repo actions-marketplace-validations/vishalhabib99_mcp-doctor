@@ -106,7 +106,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .analyzer import ToolFinding, ToolIssue
+from .analyzer import ToolFinding, ToolIssue, description_display_width
 
 try:
     from tree_sitter import Language, Node, Parser
@@ -482,6 +482,7 @@ def _build_mark3labs_finding(new_tool_call, rel: str, line: int, src: bytes, con
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=param_count,
         typed_param_count=param_count,
         has_docstring_params=documented >= param_count and param_count > 0,
@@ -495,7 +496,7 @@ def _build_mark3labs_finding(new_tool_call, rel: str, line: int, src: bytes, con
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name_val, rel, finding.line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -522,6 +523,7 @@ def _finding_from_name_description(name_val: str, description: str, rel: str, li
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=0,
         typed_param_count=0,
         has_docstring_params=False,
@@ -535,7 +537,7 @@ def _finding_from_name_description(name_val: str, description: str, rel: str, li
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name_val, rel, finding.line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -835,6 +837,7 @@ def _build_literal_tool_finding(
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=param_count,
         typed_param_count=param_count,
         has_docstring_params=documented >= param_count and param_count > 0,
@@ -849,7 +852,7 @@ def _build_literal_tool_finding(
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name_val, rel, finding.line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -1124,6 +1127,7 @@ def find_go_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
                 line=node.start_point[0] + 1,
                 has_description=bool(description.strip()),
                 description_len=len(description.strip()),
+                description_display_width=description_display_width(description.strip()),
                 param_count=param_count,
                 typed_param_count=param_count,
                 has_docstring_params=documented >= param_count and param_count > 0,
@@ -1138,7 +1142,7 @@ def find_go_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
                     "Tool has no description. An agent cannot decide when to call this.",
                     "error",
                 ))
-            elif finding.description_len < 10:
+            elif finding.description_display_width < 10:
                 finding.issues.append(ToolIssue(
                     name_val, rel, finding.line, "description",
                     f"Description is only {finding.description_len} chars — likely just restates the name.",

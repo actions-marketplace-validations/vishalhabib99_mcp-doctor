@@ -42,6 +42,24 @@ def test_vague_short_description_is_flagged_as_warning():
     assert "7 chars" in result.issues[0].message
 
 
+def test_cjk_description_is_not_falsely_flagged_as_too_short():
+    # Real bug found on xpzouying/xiaohongshu-mcp (15.6k★): a complete,
+    # well-formed Chinese description ("Check Xiaohongshu login status") is
+    # only 9 raw characters, under the 10-char threshold calibrated for
+    # English character density — but each CJK character conveys roughly a
+    # full word's worth of meaning, so a raw count unfairly flags it.
+    result = check_tool_registration("check_login", "检查小红书登录状态", None)
+    assert result.flagged is False
+
+
+def test_short_cjk_description_is_still_flagged():
+    # The display-width fix must not turn off the check entirely for CJK
+    # text — a genuinely vague one-word description should still warn.
+    result = check_tool_registration("get_weather", "天气", None)  # "weather"
+    assert result.flagged is True
+    assert result.issues[0].severity == "warning"
+
+
 def test_annotation_contradiction_is_caught_from_a_dict():
     result = check_tool_registration(
         "delete_file", "Deletes a file by path.",

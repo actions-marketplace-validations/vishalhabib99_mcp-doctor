@@ -1291,3 +1291,43 @@ def test_non_str_url_param_not_flagged(tmp_path):
     report = analyze_repo(tmp_path)
     tool = report.tools[0]
     assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_cjk_description_is_not_falsely_flagged_as_too_short(tmp_path):
+    # Real bug found on xpzouying/xiaohongshu-mcp (15.6k★): a complete,
+    # well-formed Chinese description is only 9 raw characters, under the
+    # 10-char threshold calibrated for English character density — but each
+    # CJK character conveys roughly a full word's worth of meaning, so a raw
+    # count unfairly flags it. Fixed via description_display_width, which
+    # counts a Wide/Fullwidth character as 2 columns (wcwidth convention).
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def check_login() -> bool:
+            \"\"\"检查小红书登录状态\"\"\"
+            return True
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "description" for i in tool.issues)
+
+
+def test_short_cjk_description_is_still_flagged(tmp_path):
+    # The display-width fix must not disable the check for CJK text
+    # entirely — a genuinely vague one-word description should still warn.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_weather() -> str:
+            \"\"\"天气\"\"\"
+            return "sunny"
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issues = [i for i in tool.issues if i.check == "description"]
+    assert len(issues) == 1
+    assert issues[0].severity == "warning"

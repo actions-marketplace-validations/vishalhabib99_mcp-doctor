@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,22 @@ FASTMCP_DECORATOR_NAMES = {"tool"}
 # "Tool names SHOULD be between 1 and 128 characters... allowed characters: A-Z, a-z,
 # 0-9, _, -, . ... SHOULD NOT contain spaces, commas... SHOULD be unique within a server."
 VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def description_display_width(text: str) -> int:
+    """Terminal/`wcwidth`-style display width: a Wide or Fullwidth character
+    (CJK and similar dense scripts, per Unicode's own East Asian Width
+    property) counts as 2 columns, everything else as 1 — the standard
+    convention terminals already use to size text, reused here so the
+    length-based description-quality heuristic below isn't calibrated to
+    English's character density alone. Found on a real repo,
+    `xpzouying/xiaohongshu-mcp`: complete, well-formed Chinese descriptions
+    (e.g. "检查小红书登录状态", 9 characters, a full sentence) were read as
+    artificially short — 9 raw characters undercounts how much a CJK
+    character actually conveys relative to a Latin one, while display width
+    (18) reflects it fairly without guessing at a language-specific
+    conversion factor."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
 
 
 @dataclass
@@ -62,6 +79,7 @@ class ToolFinding:
     line: int
     has_description: bool
     description_len: int
+    description_display_width: int
     param_count: int
     typed_param_count: int
     has_docstring_params: bool
@@ -735,6 +753,7 @@ def _analyze_function_as_tool(
         line=fn.lineno,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=len(args),
         typed_param_count=typed,
         has_docstring_params=documented_count >= len(args) and len(args) > 0,
@@ -751,7 +770,7 @@ def _analyze_function_as_tool(
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             tool_name, file, fn.lineno, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -889,6 +908,7 @@ def _bare_direct_call_finding(name: str, description: str, file: str, line: int)
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=0,
         typed_param_count=0,
         has_docstring_params=False,
@@ -902,7 +922,7 @@ def _bare_direct_call_finding(name: str, description: str, file: str, line: int)
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name, file, line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -1111,6 +1131,7 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
             line=node.lineno,
             has_description=bool(description.strip()),
             description_len=len(description.strip()),
+            description_display_width=description_display_width(description.strip()),
             param_count=param_count,
             typed_param_count=typed_param_count,
             has_docstring_params=typed_param_count >= param_count and param_count > 0,
@@ -1127,7 +1148,7 @@ def _find_lowlevel_tools(tree: ast.Module, file: str) -> list[ToolFinding]:
                 "Tool has no description. An agent cannot decide when to call this.",
                 "error",
             ))
-        elif finding.description_len < 10:
+        elif finding.description_display_width < 10:
             finding.issues.append(ToolIssue(
                 name, file, node.lineno, "description",
                 f"Description is only {finding.description_len} chars — likely just restates the name.",

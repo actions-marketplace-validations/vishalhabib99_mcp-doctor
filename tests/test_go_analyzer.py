@@ -897,3 +897,27 @@ def test_add_tool_with_unresolvable_identifier_is_skipped_not_crashed(tmp_path):
         """)
     findings, _ = find_go_tools(tmp_path)
     assert findings == []
+
+
+def test_cjk_description_is_not_falsely_flagged_as_too_short(tmp_path):
+    # Real bug found on xpzouying/xiaohongshu-mcp (15.6k★) itself, the repo
+    # that motivated this analyzer's own handler-unwrapping support above: a
+    # complete, well-formed Chinese description is only 9 raw characters,
+    # under the 10-char threshold calibrated for English character density.
+    # Fixed via description_display_width (wcwidth-style: a Wide/Fullwidth
+    # char counts as 2 columns), shared with the Python/TS analyzers.
+    write(tmp_path, "server.go", """
+        package main
+
+        func main() {
+            mcp.AddTool(server, &mcp.Tool{
+                Name:        "check_login",
+                Description: "检查小红书登录状态",
+            }, func(ctx context.Context, req *mcp.CallToolRequest, args any) (*mcp.CallToolResult, any, error) {
+                return nil, nil, nil
+            })
+        }
+        """)
+    findings, _ = find_go_tools(tmp_path)
+    assert len(findings) == 1
+    assert findings[0].issues == []

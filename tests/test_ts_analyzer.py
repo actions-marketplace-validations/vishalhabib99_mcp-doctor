@@ -779,3 +779,20 @@ def test_bare_const_array_value_is_not_mistaken_for_a_tool(tmp_path):
         """)
     findings, _ = find_ts_tools(tmp_path)
     assert findings == []
+
+
+def test_cjk_description_is_not_falsely_flagged_as_too_short(tmp_path):
+    # Same real bug as the Python/Go analyzers (found on
+    # xpzouying/xiaohongshu-mcp, 15.6k★): a complete, well-formed Chinese
+    # description is only 9 raw characters, under the 10-char threshold
+    # calibrated for English character density. Fixed via
+    # description_display_width (wcwidth-style: a Wide/Fullwidth char
+    # counts as 2 columns), shared across all three language analyzers.
+    write(tmp_path, "server.ts", """
+        server.registerTool("check_login", { description: "检查小红书登录状态", inputSchema: z.object({}) }, async () => {
+          return { content: [] };
+        });
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    tool = findings[0]
+    assert not any(i.check == "description" for i in tool.issues)

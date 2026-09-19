@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .analyzer import ToolFinding, ToolIssue
+from .analyzer import ToolFinding, ToolIssue, description_display_width
 
 try:
     from tree_sitter import Language, Node, Parser
@@ -422,6 +422,7 @@ def _finding_with_description_and_param_issues(
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=param_count,
         typed_param_count=param_count,
         has_docstring_params=documented >= param_count and param_count > 0,
@@ -436,7 +437,7 @@ def _finding_with_description_and_param_issues(
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name, file, line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
