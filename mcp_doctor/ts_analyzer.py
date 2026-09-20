@@ -568,7 +568,7 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
         if any(part in skip_dirs or part.startswith(".") for part in rel_parts):
             continue
         stem = p.stem.lower()
-        # Directory-based exclusion matches the Python analyzer's `_is_test_file`
+        # Directory-based exclusion matches the Python analyzer's `_is_auxiliary_file`
         # (any "test"/"tests" path segment) — verified against a real miss:
         # mcp-use/mcp-use's `libraries/typescript/packages/agent/tests/servers/
         # simple_server.ts`, a genuine test fixture ("Minimal stdio MCP server

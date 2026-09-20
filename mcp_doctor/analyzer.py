@@ -1229,19 +1229,33 @@ def _find_class_based_tools(
 _JS_TEST_SUFFIXES = (".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")
 
 
-def _is_test_file(path: Path) -> bool:
+# Excludes files that can never be part of a tool's reachable execution
+# path, so quality/tool-finding never registers a "tool" defined in one and
+# the security scans never flag a call inside one as if a model argument
+# could reach it. Started as test-file exclusion only; broadened to a
+# `scripts/` path component after a real false positive: arxiv-mcp-server's
+# scripts/smoke_installed_wheel.py builds a venv and installs a wheel via
+# fixed, non-tool-derived subprocess.run() calls purely to smoke-test a
+# release — flagged by the dangerous-exec check exactly like tool code
+# would be. Breadth-checked before broadening: a `scripts/` directory full
+# of release/build subprocess calls unrelated to any tool is a common
+# convention repo-wide (aws/chalice, colobot/colobot, diem/diem and others
+# all follow it), not a one-off. Deliberately narrow to `scripts/` — not
+# `tools/`, which in some repos is genuinely where tool implementations
+# live.
+def _is_auxiliary_file(path: Path) -> bool:
     name = path.name
     if name.startswith("test_") or name.endswith("_test.py") or name.endswith("_test.go"):
         return True
     if name.endswith(_JS_TEST_SUFFIXES):
         return True
-    return any(part in ("test", "tests") for part in path.parts)
+    return any(part in ("test", "tests", "scripts") for part in path.parts)
 
 
 def _scan_secrets(py_files: list[Path]) -> list[RepoIssue]:
     issues = []
     for f in py_files:
-        if _is_test_file(f):
+        if _is_auxiliary_file(f):
             continue
         try:
             text = f.read_text(errors="ignore")
@@ -1276,7 +1290,7 @@ def analyze_repo(root: Path) -> Report:
     trees: list[tuple[str, ast.Module]] = []
     unparseable: list[str] = []
     for f in py_files:
-        if _is_test_file(f):
+        if _is_auxiliary_file(f):
             continue
         try:
             tree = ast.parse(f.read_text(errors="ignore"), filename=str(f))
@@ -1403,12 +1417,12 @@ def analyze_repo(root: Path) -> Report:
         if p.suffix in (".ts", ".tsx", ".js", ".jsx")
         and not p.name.endswith(".d.ts")  # ambient type declarations — no executable code, ever
         and "/node_modules/" not in str(p) and "/.git/" not in str(p)
-        and not _is_test_file(p)
+        and not _is_auxiliary_file(p)
     ]
     go_files = [
         p for p in root.rglob("*.go")
         if "/vendor/" not in str(p) and "/.git/" not in str(p)
-        and not _is_test_file(p)
+        and not _is_auxiliary_file(p)
     ]
     all_files = py_files + ts_js_files + go_files
     repo_issues.extend(_scan_secrets(all_files))

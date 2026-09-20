@@ -244,6 +244,60 @@ def test_eval_in_test_file_is_not_flagged(tmp_path):
     assert "dangerous_exec" not in {i.check for i in report.repo_issues}
 
 
+def test_subprocess_call_in_scripts_dir_is_not_flagged(tmp_path):
+    # Real false positive, found dogfooding blazickjp/arxiv-mcp-server:
+    # scripts/smoke_installed_wheel.py builds a venv and installs a built
+    # wheel via subprocess.run() with fixed, non-tool-derived arguments,
+    # purely to smoke-test a release — nothing a model argument could ever
+    # reach. A `scripts/` directory of release/build tooling is a common
+    # convention repo-wide, not specific to this one repo.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Args:
+                city: The city name.
+            \"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return ""
+        """)
+    make_clean_repo(tmp_path)
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "smoke_installed_wheel.py").write_text(
+        "import subprocess\nsubprocess.run(['uv', 'venv'], check=True)\n"
+    )
+
+    report = analyze_repo(tmp_path)
+    assert "dangerous_exec" not in {i.check for i in report.repo_issues}
+
+
+def test_subprocess_call_outside_scripts_dir_is_still_flagged(tmp_path):
+    # Guards against over-broadening: a dangerous call in ordinary package
+    # source, not under scripts/tests, must still be caught.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    make_clean_repo(tmp_path)
+    (tmp_path / "helpers.py").write_text(
+        "import subprocess\ndef run(cmd):\n    subprocess.run(cmd)\n"
+    )
+
+    report = analyze_repo(tmp_path)
+    assert "dangerous_exec" in {i.check for i in report.repo_issues}
+
+
 def test_ssrf_flags_variable_url_but_not_literal(tmp_path):
     write(tmp_path, "server.py", """
         import requests

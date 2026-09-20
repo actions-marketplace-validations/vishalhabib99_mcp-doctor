@@ -21,7 +21,7 @@ import json
 import re
 from pathlib import Path
 
-from .analyzer import RepoIssue, ToolFinding, ToolIssue, _is_test_file
+from .analyzer import RepoIssue, ToolFinding, ToolIssue, _is_auxiliary_file
 
 # --- Prompt injection / tool poisoning ---------------------------------
 #
@@ -149,7 +149,7 @@ def _mask_strings_and_line_comments(line: str) -> str:
 def scan_dangerous_exec(files: list[Path]) -> list[RepoIssue]:
     issues = []
     for f in files:
-        if _is_test_file(f):
+        if _is_auxiliary_file(f):
             continue
         try:
             text = f.read_text(errors="ignore")
@@ -191,7 +191,7 @@ _HTTP_CALL_WITH_VAR_ARG = [
 def scan_ssrf(files: list[Path]) -> list[RepoIssue]:
     issues = []
     for f in files:
-        if _is_test_file(f):
+        if _is_auxiliary_file(f):
             continue
         try:
             text = f.read_text(errors="ignore")
@@ -223,7 +223,7 @@ _YAML_SAFE_LOADER = re.compile(r"Loader\s*=\s*yaml\.SafeLoader")
 def scan_unsafe_deserialization(py_files: list[Path]) -> list[RepoIssue]:
     issues = []
     for f in py_files:
-        if _is_test_file(f):
+        if _is_auxiliary_file(f):
             continue
         try:
             text = f.read_text(errors="ignore")
