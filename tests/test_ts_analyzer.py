@@ -437,6 +437,68 @@ def test_list_tools_handler_zod_to_json_schema_unwrapped(tmp_path):
     assert "Zod schema properties" in param_issue.message
 
 
+def test_list_tools_handler_object_values_namespace_import(tmp_path):
+    # `tools: Object.values(tools)` where `tools` is `import * as tools from
+    # "./tools.js"` and that module exports one `const` object per tool —
+    # verified against the real zcaceres/markdownify-mcp (11 tools, all
+    # previously invisible: "0 tool(s) found") and flesler/mcp-tasks. Distinct
+    # from the already-supported `[...ToolArrayConst]` spread style: there's no
+    # array literal anywhere, only a namespace object turned into one via
+    # `Object.values`.
+    write(tmp_path, "tools.ts", """
+        import { ToolSchema } from "@modelcontextprotocol/sdk/types.js";
+
+        export const PdfToMarkdownTool = ToolSchema.parse({
+          name: "pdf-to-markdown",
+          description: "Convert a PDF file to markdown",
+          inputSchema: {
+            type: "object",
+            properties: {
+              filepath: { type: "string", description: "Absolute path of the PDF file" },
+            },
+            required: ["filepath"],
+          },
+        });
+
+        export const GetMarkdownFileTool = ToolSchema.parse({
+          name: "get-markdown-file",
+          description: "",
+          inputSchema: { type: "object", properties: {}, required: [] },
+        });
+        """)
+    write(tmp_path, "server.ts", """
+        import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+        import * as tools from "./tools.js";
+
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
+          return { tools: Object.values(tools) };
+        });
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    assert len(findings) == 2
+    by_name = {t.name: t for t in findings}
+    assert set(by_name) == {"pdf-to-markdown", "get-markdown-file"}
+    assert by_name["pdf-to-markdown"].file == "tools.ts"  # reported at its own definition
+    assert any(i.check == "description" for i in by_name["get-markdown-file"].issues)
+
+
+def test_list_tools_handler_object_values_unresolvable_import_skipped(tmp_path):
+    # `Object.values(tools)` where `tools` comes from a bare-specifier package
+    # import (not a same-repo relative path) can't be traced to any source this
+    # analyzer can read — must be skipped like any other genuinely dynamic
+    # value, not crash or guess.
+    write(tmp_path, "server.ts", """
+        import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+        import * as tools from "some-external-package";
+
+        server.setRequestHandler(ListToolsRequestSchema, async () => ({
+          tools: Object.values(tools),
+        }));
+        """)
+    findings, _ = find_ts_tools(tmp_path)
+    assert findings == []
+
+
 def test_analyze_repo_includes_ts_tools(tmp_path):
     write(tmp_path, "server.ts", """
         server.registerTool("x", { description: "Does x thing", inputSchema: z.object({}) }, async () => {

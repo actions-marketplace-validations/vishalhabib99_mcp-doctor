@@ -10,6 +10,7 @@ for the official TS SDK's two high-level registration styles, the community
     server.tool(name, description, zodShapeOrConst, handler)
     server.addTool({ name, description, parameters: ZodObjectOrConst, execute })
     server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...ToolArrayConst] }))
+    server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: Object.values(toolsNamespaceImport) }))
     defineTool({ name, description, schema, handler })   // or definePageTool(...)
     defineTool(args => ({ name, description, schema, handler }))
     const fooTool = { schema: { name, description, inputSchema }, handle }  // no wrapping call at all
@@ -332,6 +333,72 @@ def _collect_const_objects(tree_root, src: bytes) -> dict[str, tuple["Node", byt
     return registry
 
 
+def _collect_namespace_imports(tree_root, src: bytes) -> dict[str, str]:
+    """Map each `import * as NAME from "SPEC"` namespace import's local NAME to
+    its raw module specifier, so `Object.values(NAME)` (a real pattern — a
+    module exporting one `const` per tool, collected as a namespace object and
+    turned into an array — verified against zcaceres/markdownify-mcp and
+    flesler/mcp-tasks) can be traced to the module whose exports it wraps."""
+    out: dict[str, str] = {}
+    for n in tree_root.children:
+        if n.type != "import_statement":
+            continue
+        clause = next((c for c in n.children if c.type == "import_clause"), None)
+        source_node = next((c for c in n.children if c.type == "string"), None)
+        if clause is None or source_node is None:
+            continue
+        ns = next((c for c in clause.children if c.type == "namespace_import"), None)
+        if ns is None:
+            continue
+        ident = next((c for c in ns.children if c.type == "identifier"), None)
+        spec = _string_value(source_node, src)
+        if ident is not None and spec is not None:
+            out[_text(ident, src)] = spec
+    return out
+
+
+def _object_values_arg(node) -> "Node | None":
+    """For `Object.values(X)`, return the `X` argument node, else None."""
+    if node is None or node.type != "call_expression":
+        return None
+    func = node.child_by_field_name("function")
+    if func is None or func.type != "member_expression":
+        return None
+    obj = func.child_by_field_name("object")
+    prop = func.child_by_field_name("property")
+    if obj is None or prop is None or obj.type != "identifier" or prop.type != "property_identifier":
+        return None
+    if obj.text != b"Object" or prop.text != b"values":
+        return None
+    args_node = node.child_by_field_name("arguments")
+    if args_node is None:
+        return None
+    arg_nodes = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+    return arg_nodes[0] if len(arg_nodes) == 1 and arg_nodes[0].type == "identifier" else None
+
+
+def _module_exported_consts(module_root, module_src: bytes) -> dict[str, tuple["Node", bytes]]:
+    """Top-level `export const NAME = <expr>` declarations only (not every
+    `const` anywhere in the file, unlike `_collect_const_objects`) — this is
+    what a `import * as X from "./module"` namespace object actually exposes,
+    in declaration order to match `Object.values()`'s real iteration order."""
+    out: dict[str, tuple["Node", bytes]] = {}
+    for n in module_root.children:
+        decl = n
+        if n.type == "export_statement":
+            decl = next((c for c in n.children if c.type in ("lexical_declaration", "variable_declaration")), None)
+        if decl is None or decl.type not in ("lexical_declaration", "variable_declaration"):
+            continue
+        for child in decl.children:
+            if child.type != "variable_declarator":
+                continue
+            name_node = child.child_by_field_name("name")
+            value_node = child.child_by_field_name("value")
+            if name_node is not None and name_node.type == "identifier" and value_node is not None:
+                out[_text(name_node, module_src)] = (value_node, module_src)
+    return out
+
+
 def _resolve(node, src: bytes, consts: dict[str, tuple["Node", bytes]], depth: int = 0):
     """Resolve an identifier/member-expression/`||`-default down to a literal
     node, returning (resolved_node, its_src) since resolution can cross files."""
@@ -388,6 +455,17 @@ def _resolve(node, src: bytes, consts: dict[str, tuple["Node", bytes]], depth: i
                 prop_name = _text(prop, src)
                 if prop_name == "filter":
                     return _resolve(obj_node, src, consts, depth + 1)
+                if prop_name == "parse":
+                    # `ToolSchema.parse({...})` — a common Zod idiom for
+                    # validate-and-return: the object passed in is exactly
+                    # what's registered (parse returns its argument unchanged
+                    # when valid), so resolve straight through to it rather
+                    # than treating the call as an opaque dynamic value.
+                    args_node = node.child_by_field_name("arguments")
+                    if args_node is not None:
+                        call_args = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+                        if len(call_args) == 1:
+                            return _resolve(call_args[0], src, consts, depth + 1)
                 if prop_name in ("trim", "trimStart", "trimEnd"):
                     # `` `...long description...`.trim() `` — a real, common
                     # idiom for a multi-line template-literal description
@@ -610,11 +688,26 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
     src_to_rel: dict[int, str] = {id(s): str(f.relative_to(root)) for f, _, s in parsed}
     seen_list_tools: set[tuple[str, str, int]] = set()
 
+    # Resolves a relative `import * as X from "./spec"` module specifier to the
+    # parsed file it refers to, tolerating the common TS-emits-.js-imports-for-
+    # .ts-source mismatch by comparing paths with their suffix stripped.
+    by_module_path: dict[Path, tuple[Path, "Node", bytes]] = {
+        f.with_suffix(""): (f, file_root, file_src) for f, file_root, file_src in parsed
+    }
+    module_exports_cache: dict[Path, dict[str, tuple["Node", bytes]]] = {}
+
+    def _resolve_namespace_module(current_file: Path, spec: str):
+        if not spec.startswith("."):
+            return None  # only same-repo relative imports are traceable
+        target = (current_file.parent / spec).resolve().with_suffix("")
+        return by_module_path.get(target)
+
     for f, file_root, src in parsed:
         rel = str(f.relative_to(root))
         local_consts = _collect_const_objects(file_root, src)
         consts = {**global_consts, **local_consts}
         local_funcs = _collect_function_declarations(file_root, src)
+        namespace_imports = _collect_namespace_imports(file_root, src)
 
         for node in _walk(file_root):
             if node.type == "variable_declarator":
@@ -682,8 +775,32 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
                 tools_array_raw = _find_tools_array(arg_nodes[1], src)
                 if tools_array_raw is None:
                     continue
-                tools_array, tools_array_src = _resolve(tools_array_raw, src, consts)
-                for tool_obj, tool_src in _collect_tool_array_elements(tools_array, tools_array_src, consts):
+
+                # `Object.values(tools)` where `tools` is a namespace import
+                # (`import * as tools from "./tools.js"`) — the module it
+                # points at exports one `const` object per tool rather than a
+                # single array, so its elements come from that module's own
+                # top-level exports instead of `_collect_tool_array_elements`.
+                ns_arg = _object_values_arg(tools_array_raw)
+                tool_elements: list[tuple["Node", bytes]] = []
+                if ns_arg is not None:
+                    spec = namespace_imports.get(_text(ns_arg, src))
+                    module_entry = _resolve_namespace_module(f, spec) if spec else None
+                    if module_entry is not None:
+                        mod_path, mod_root, mod_src = module_entry
+                        mod_exports = module_exports_cache.get(mod_path)
+                        if mod_exports is None:
+                            mod_exports = _module_exported_consts(mod_root, mod_src)
+                            module_exports_cache[mod_path] = mod_exports
+                        for value_node, value_src in mod_exports.values():
+                            resolved_val, resolved_val_src = _resolve(value_node, value_src, consts)
+                            if resolved_val.type == "object":
+                                tool_elements.append((resolved_val, resolved_val_src))
+                else:
+                    tools_array, tools_array_src = _resolve(tools_array_raw, src, consts)
+                    tool_elements = _collect_tool_array_elements(tools_array, tools_array_src, consts)
+
+                for tool_obj, tool_src in tool_elements:
                     pairs = _object_pairs(tool_obj, tool_src)
                     name_val = _resolve_str(pairs.get("name"), tool_src, consts)
                     if name_val is None:
