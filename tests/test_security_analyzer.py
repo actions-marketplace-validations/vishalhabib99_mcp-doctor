@@ -298,6 +298,35 @@ def test_subprocess_call_outside_scripts_dir_is_still_flagged(tmp_path):
     assert "dangerous_exec" in {i.check for i in report.repo_issues}
 
 
+def test_subprocess_call_in_benchmarks_dir_is_not_flagged(tmp_path):
+    # Real false positive, found dogfooding MinishLab/semble: benchmarks/ and
+    # benchmarks/baselines/ shell out to competing CLI tools (ripgrep-style
+    # baselines) purely to compare performance — 21 of 22 dangerous-exec
+    # flags on that repo were here, none reachable from either of its 2 real
+    # MCP tools. A top-level `benchmarks/` directory of subprocess calls
+    # unrelated to any tool is a common convention repo-wide, not specific
+    # to this one repo.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    make_clean_repo(tmp_path)
+    (tmp_path / "benchmarks" / "baselines").mkdir(parents=True)
+    (tmp_path / "benchmarks" / "baselines" / "ripgrep_baseline.py").write_text(
+        "import subprocess\nsubprocess.run(['rg', '--version'], check=True)\n"
+    )
+
+    report = analyze_repo(tmp_path)
+    assert "dangerous_exec" not in {i.check for i in report.repo_issues}
+
+
 def test_ssrf_flags_variable_url_but_not_literal(tmp_path):
     write(tmp_path, "server.py", """
         import requests

@@ -1243,13 +1243,22 @@ _JS_TEST_SUFFIXES = (".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".spec.ts
 # all follow it), not a one-off. Deliberately narrow to `scripts/` — not
 # `tools/`, which in some repos is genuinely where tool implementations
 # live.
+# Broadened again to `benchmarks/` after a second real false positive:
+# MinishLab/semble's benchmarks/ and benchmarks/baselines/ shell out to
+# competing CLI tools (ripgrep-style baselines) purely to compare
+# performance — 21 of 22 dangerous-exec flags on that repo were in these
+# directories, none of them reachable from either of its 2 real MCP tools.
+# Breadth-checked the same way as `scripts/`: a top-level `benchmarks/`
+# directory full of subprocess calls unrelated to any tool is a common,
+# independently-authored convention (pypa/pipenv, pytorch/xla,
+# facebookexperimental/hermit and others all follow it), not a one-off.
 def _is_auxiliary_file(path: Path) -> bool:
     name = path.name
     if name.startswith("test_") or name.endswith("_test.py") or name.endswith("_test.go"):
         return True
     if name.endswith(_JS_TEST_SUFFIXES):
         return True
-    return any(part in ("test", "tests", "scripts") for part in path.parts)
+    return any(part in ("test", "tests", "scripts", "benchmarks") for part in path.parts)
 
 
 def _scan_secrets(py_files: list[Path]) -> list[RepoIssue]:
