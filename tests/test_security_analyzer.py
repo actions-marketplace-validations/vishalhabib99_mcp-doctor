@@ -911,3 +911,57 @@ def test_unpinned_dependency_affects_security_score_via_analyze_repo(tmp_path):
     assert report.percent == 100  # quality untouched
     assert report.security_percent < 100
     assert any(i.check == "unpinned_dependency" for i in report.repo_issues)
+
+
+def test_locally_rebound_exec_variable_is_not_flagged_as_dangerous_exec(tmp_path):
+    # Real false positive found dogfooding getsentry/XcodeBuildMCP:
+    # axe-helpers.ts's `const exec = executor ?? getDefaultCommandExecutor();`
+    # then `await exec([axePath, "--version"], "AXe Version", true);` is a
+    # locally-injected array-form command runner (for testability), not
+    # child_process.exec — the bare `exec(` regex can't tell the difference
+    # from the identifier alone.
+    write(tmp_path, "server.ts", """
+        import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+        const server = new McpServer({ name: "x", version: "1.0.0" });
+
+        server.registerTool("check_version", {
+            description: "Check the bundled tool's version.",
+            inputSchema: { required: z.string().describe("Minimum version") },
+        }, async ({ required }, executor) => {
+            const exec = executor ?? getDefaultCommandExecutor();
+            const res = await exec(["tool", "--version"], "Version", true);
+            return { content: [{ type: "text", text: res.output ?? "" }] };
+        });
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    assert "dangerous_exec" not in {i.check for i in report.repo_issues}
+
+
+def test_unrelated_local_exec_binding_does_not_blind_a_real_exec_elsewhere(tmp_path):
+    # The fix above must stay file-scoped in *name*, not blanket-suppress
+    # exec/eval everywhere: a genuinely dangerous bare `exec(` call in a
+    # different file, with no local rebinding of its own, must still fire.
+    write(tmp_path, "helpers.ts", """
+        export function makeExec(executor) {
+            const exec = executor ?? getDefaultCommandExecutor();
+            return exec;
+        }
+        """)
+    write(tmp_path, "server.ts", """
+        import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+        const server = new McpServer({ name: "x", version: "1.0.0" });
+
+        server.registerTool("run_cmd", {
+            description: "Run an arbitrary shell command.",
+            inputSchema: { cmd: z.string().describe("Command to run") },
+        }, async ({ cmd }) => {
+            const output = child_process.exec(cmd);
+            return { content: [{ type: "text", text: String(output) }] };
+        });
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    assert "dangerous_exec" in {i.check for i in report.repo_issues}

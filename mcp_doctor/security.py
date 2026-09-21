@@ -108,6 +108,34 @@ _DANGEROUS_EXEC_PATTERNS = [
     re.compile(r"\bexec\.Command\s*\("),  # Go os/exec
 ]
 
+# The two *bare*-identifier patterns above (`eval(...)`, `exec(...)` with no
+# preceding dot) are the only ones a local variable can shadow — the other
+# patterns always name a specific module/global (`os.system`, `child_process.
+# exec`, `exec.Command`), so rebinding a local `exec` can never make one of
+# those match instead. Kept as separate handles so the shadow check below can
+# suppress only these two, not the whole list.
+_BARE_EVAL_RE = _DANGEROUS_EXEC_PATTERNS[0]
+_BARE_EXEC_RE = _DANGEROUS_EXEC_PATTERNS[2]
+
+# A local `const exec = ...`/`let exec = ...`/`var exec = ...` binding (JS/TS)
+# shadows any global `exec`/`eval` for the rest of that scope — a bare
+# `exec(...)` call afterward is calling that local variable, not the
+# dangerous builtin or `child_process.exec`. A common, real shape: a
+# dependency-injected command runner named `exec` for testability (`const
+# exec = executor ?? getDefaultCommandExecutor();` then `exec([...])`).
+# Verified against a real false positive dogfooding getsentry/XcodeBuildMCP's
+# axe-helpers.ts, which binds `exec` to its own array-form `CommandExecutor`
+# type this way — confirmed not a one-off naming coincidence via the same
+# `const exec = executor ?? ...` idiom recurring independently in
+# Seitrace/seitrace-mcp (another real MCP server) and several unrelated repos.
+_LOCAL_EXEC_OR_EVAL_BINDING_RE = re.compile(
+    r"\b(?:const|let|var)\s+(exec|eval)\s*="
+)
+
+
+def _locally_rebound_names(text: str) -> set[str]:
+    return {m.group(1) for m in _LOCAL_EXEC_OR_EVAL_BINDING_RE.finditer(text)}
+
 # A line like `exec(sql: string): void {` or `exec(sql: string): void;` is
 # declaring a method/function literally *named* exec/eval (e.g. implementing
 # a DatabaseAdapter.exec(sql) interface around a SQL driver's own .exec()),
@@ -155,19 +183,33 @@ def scan_dangerous_exec(files: list[Path]) -> list[RepoIssue]:
             text = f.read_text(errors="ignore")
         except OSError:
             continue
+        rebound = _locally_rebound_names(text)
         for i, line in enumerate(text.splitlines(), start=1):
             if _TS_EXEC_OR_EVAL_DECL_RE.match(line):
                 continue
             masked = _mask_strings_and_line_comments(line)
-            if any(p.search(masked) for p in _DANGEROUS_EXEC_PATTERNS):
-                issues.append(RepoIssue(
-                    "dangerous_exec",
-                    f"{f.name}:{i} calls a dynamic-execution/shell primitive (eval/exec/subprocess/"
-                    "os.system/child_process.exec) — if any part of the command or code string can "
-                    "trace back to a tool argument, this is arbitrary code execution triggered by "
-                    "model output.",
-                    "error", "security",
-                ))
+            matched = [p for p in _DANGEROUS_EXEC_PATTERNS if p.search(masked)]
+            if not matched:
+                continue
+            # Only the two bare-identifier patterns can be a shadowed local
+            # variable rather than the real builtin/child_process call — if
+            # every pattern that matched this line is one of those, and that
+            # name was locally rebound somewhere in the file, it's the local
+            # variable, not the dangerous primitive.
+            if rebound and all(
+                (p is _BARE_EVAL_RE and "eval" in rebound)
+                or (p is _BARE_EXEC_RE and "exec" in rebound)
+                for p in matched
+            ):
+                continue
+            issues.append(RepoIssue(
+                "dangerous_exec",
+                f"{f.name}:{i} calls a dynamic-execution/shell primitive (eval/exec/subprocess/"
+                "os.system/child_process.exec) — if any part of the command or code string can "
+                "trace back to a tool argument, this is arbitrary code execution triggered by "
+                "model output.",
+                "error", "security",
+            ))
     return issues
 
 
