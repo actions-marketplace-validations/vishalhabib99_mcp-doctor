@@ -1,16 +1,31 @@
 """Static analysis of TypeScript/JavaScript MCP server implementations.
 
 Mirrors analyzer.py's checks (description, per-parameter docs, error handling)
-for the official TS SDK's two registration styles, plus the community
-`fastmcp` (punkpeye/fastmcp) package's single-object style:
+for the official TS SDK's two high-level registration styles, the community
+`fastmcp` (punkpeye/fastmcp) package's single-object style, and the low-level
+`Server` SDK's static-list style:
 
     server.registerTool(name, { description, inputSchema: ZodObjectOrConst }, handler)
+    context.accountTool(name, { description, inputSchema: ZodObjectOrConst }, handler)  // same config shape as registerTool, wrapping it internally
     server.tool(name, description, zodShapeOrConst, handler)
     server.addTool({ name, description, parameters: ZodObjectOrConst, execute })
+    server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...ToolArrayConst] }))
+    server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: Object.values(toolsNamespaceImport) }))
+    defineTool({ name, description, schema, handler })   // or definePageTool(...)
+    defineTool(args => ({ name, description, schema, handler }))
+    const fooTool = { schema: { name, description, inputSchema }, handle }  // no wrapping call at all
 
-Both the config object and the Zod schema are commonly a same-file `const`
-reference rather than an inline literal (see the official `everything`
-reference server), so this resolves same-file identifiers before giving up.
+The last style has no per-tool handler closure to check for a try/catch (one
+generic dispatcher serves every tool by name, often proxying elsewhere
+entirely), so error_handling is intentionally not checked for it.
+
+The name, config object, and Zod schema are commonly a `const` reference
+rather than an inline literal, and the name is often a member-expression
+property access on an exported tool-definition object (e.g.
+`server.registerTool(fooTool.name, ...)` where `fooTool` is defined and
+exported from another file) — this resolves identifiers, `||`-default
+expressions, and cross-file member-expression property lookups before
+giving up.
 
 Requires the optional `tree_sitter` / `tree_sitter_typescript` packages —
 callers should treat their absence as "skip TS/JS analysis", not an error.
@@ -20,7 +35,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .analyzer import ToolFinding, ToolIssue
+from .analyzer import ToolFinding, ToolIssue, description_display_width
 
 try:
     from tree_sitter import Language, Node, Parser
@@ -30,9 +45,20 @@ try:
 except ImportError:  # pragma: no cover - exercised via TS_AVAILABLE branch
     TS_AVAILABLE = False
 
-REGISTER_METHODS = {"registerTool", "tool"}
+REGISTER_METHODS = {"registerTool", "tool", "accountTool"}
 # fastmcp's single-object style: server.addTool({ name, description, parameters, execute })
 SINGLE_OBJECT_METHODS = {"addTool"}
+# low-level Server SDK style: server.setRequestHandler(ListToolsRequestSchema, handler)
+LIST_TOOLS_METHOD = "setRequestHandler"
+LIST_TOOLS_SCHEMA = "ListToolsRequestSchema"
+# a "define the tool, register it elsewhere" wrapper factory: the call itself
+# *is* the definition site (e.g. Chrome DevTools MCP's `defineTool({...})` /
+# `definePageTool({...})`), taking either an object literal directly or a
+# function that returns one — the actual `server.registerTool(...)` call that
+# consumes it is a runtime loop over a collected array, which doesn't need to
+# be resolved since every `defineTool`/`definePageTool` call site already is
+# one tool definition on its own.
+WRAPPER_FACTORY_METHODS = {"defineTool", "definePageTool"}
 
 
 def _text(node, src: bytes) -> str:
@@ -67,20 +93,41 @@ def _string_value(node, src: bytes) -> str | None:
         frag = next((c for c in node.children if c.type == "string_fragment"), None)
         return _text(frag, src) if frag is not None else ""
     if node.type == "template_string":
-        # Only trust a template literal with no ${...} interpolation.
-        if any(c.type == "template_substitution" for c in node.children):
-            return None
-        frag = next((c for c in node.children if c.type == "string_fragment"), None)
-        return _text(frag, src) if frag is not None else ""
+        # Join every literal fragment, dropping `${...}` substitutions rather
+        # than discarding the whole string. A description built as static
+        # boilerplate plus one interpolated suffix (e.g. a shared
+        # `${CMD_PREFIX_DESCRIPTION}` appended to every tool) is common and
+        # still has real, checkable text — only the dynamic part is unknown,
+        # and omitting it can only under-count length, never fabricate content.
+        fragments = [_text(c, src) for c in node.children if c.type == "string_fragment"]
+        return "".join(fragments)
+    if node.type == "binary_expression":
+        # `'...' + '...'` — a common way to wrap a long description across
+        # multiple lines. Only resolves if both sides are themselves literal;
+        # a concatenation involving a variable is left unresolved rather than
+        # guessed at (better to under-count than to fabricate content).
+        operator = node.child_by_field_name("operator")
+        if operator is not None and operator.text == b"+":
+            left_val = _string_value(node.child_by_field_name("left"), src)
+            right_val = _string_value(node.child_by_field_name("right"), src)
+            if left_val is not None and right_val is not None:
+                return left_val + right_val
     return None
 
 
 def _object_pairs(node, src: bytes) -> dict[str, "Node"]:
-    """For an `object` node, map property name -> value node. Skips computed/shorthand keys."""
+    """For an `object` node, map property name -> value node. Skips computed keys."""
     if node is None or node.type != "object":
         return {}
     pairs = {}
     for child in node.children:
+        if child.type == "shorthand_property_identifier":
+            # `{ tools }` — shorthand for `{ tools: tools }`. The node itself
+            # is both the key name and a reference to the same-named local
+            # variable, so it doubles as its own value node; `_resolve` treats
+            # it exactly like a regular `identifier` when looking it up.
+            pairs[_text(child, src)] = child
+            continue
         if child.type != "pair":
             continue
         key_node = child.child_by_field_name("key")
@@ -98,8 +145,14 @@ def _object_pairs(node, src: bytes) -> dict[str, "Node"]:
     return pairs
 
 
-def _has_describe_call(node) -> bool:
-    """True if `.describe(...)` appears anywhere in this expression's call chain."""
+def _has_describe_call(node, src: bytes | None = None, consts: dict | None = None) -> bool:
+    """True if `.describe(...)` appears anywhere in this expression's call chain.
+    If consts is given, first resolves a bare identifier — a Zod schema is
+    commonly factored into a shared const and reused across several tools —
+    to its definition, so a shared schema's own `.describe(...)` isn't missed
+    just because this particular property references it by name."""
+    if consts is not None:
+        node, _ = _resolve(node, src, consts)
     for n in _walk(node):
         if n.type == "call_expression" and _callee_name(n) == "describe":
             return True
@@ -125,68 +178,335 @@ def _zod_object_arg(node):
     return None
 
 
+def _zod_wrapped_schema(node, src: bytes, consts: dict):
+    """If a raw-JSON-Schema `inputSchema` value is actually
+    `zodToJsonSchema(SomeArgsSchema)` (the well-known `zod-to-json-schema`
+    package), resolve to the underlying Zod schema argument so it can still be
+    analyzed as one. Returns (node, src) — never None for the tuple itself,
+    though the node may be None if there's nothing to resolve."""
+    if node is None or node.type != "call_expression":
+        return None, src
+    func = node.child_by_field_name("function")
+    if func is None or func.type != "identifier" or _text(func, src) != "zodToJsonSchema":
+        return None, src
+    args_node = node.child_by_field_name("arguments")
+    if args_node is None:
+        return None, src
+    arg_nodes = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+    if not arg_nodes:
+        return None, src
+    return _resolve(arg_nodes[0], src, consts)
+
+
+def _find_tools_array(handler_node, src: bytes):
+    """Search a `setRequestHandler(ListToolsRequestSchema, handler)` handler body
+    for the object literal it builds its response from (`{ tools: [...] }`,
+    however it's returned) and return that `tools` property's raw value node."""
+    for n in _walk(handler_node):
+        if n.type == "object":
+            tools_val = _object_pairs(n, src).get("tools")
+            if tools_val is not None:
+                return tools_val
+    return None
+
+
+def _collect_tool_array_elements(array_node, src: bytes, consts: dict, depth: int = 0):
+    """Return [(tool_object_node, its_src), ...] for every literal `Tool` object
+    a `tools` array directly contains, following `...someConstArray` spreads
+    (repo-wide, via `consts`) into their own elements recursively. A spread of
+    something that doesn't resolve to an array literal (e.g. a function call's
+    result, built at runtime) is genuinely dynamic and is skipped, not guessed at.
+    """
+    if array_node is None or array_node.type != "array" or depth > 5:
+        return []
+    out: list[tuple["Node", bytes]] = []
+    for child in array_node.children:
+        if child.type == "object":
+            out.append((child, src))
+        elif child.type == "spread_element":
+            inner = child.children[-1] if child.children else None
+            if inner is not None:
+                resolved, resolved_src = _resolve(inner, src, consts)
+                if resolved.type == "array":
+                    out.extend(_collect_tool_array_elements(resolved, resolved_src, consts, depth + 1))
+    return out
+
+
+def _extract_definition_object(node, src: bytes):
+    """For a `defineTool`/`definePageTool` call's single argument, return the
+    tool-definition `object` literal — whether passed directly, or built by a
+    factory function (`args => ({...})` or `args => { return {...}; }`).
+    A function body with no top-level `return {...}` is genuinely dynamic
+    (e.g. conditional returns) and yields (None, src) rather than a guess."""
+    if node is None:
+        return None, src
+    if node.type == "object":
+        return node, src
+    if node.type not in ("arrow_function", "function_expression"):
+        return None, src
+    body = node.child_by_field_name("body")
+    if body is None:
+        return None, src
+    if body.type == "object":
+        return body, src
+    if body.type == "parenthesized_expression":
+        inner = next((c for c in body.children if c.type == "object"), None)
+        return (inner, src) if inner is not None else (None, src)
+    if body.type == "statement_block":
+        for child in body.children:
+            if child.type != "return_statement":
+                continue
+            for c in child.children:
+                if c.type == "object":
+                    return c, src
+                if c.type == "parenthesized_expression":
+                    inner = next((x for x in c.children if x.type == "object"), None)
+                    if inner is not None:
+                        return inner, src
+    return None, src
+
+
 def _find_try(node) -> bool:
     return any(n.type == "try_statement" for n in _walk(node))
 
 
-def _collect_const_objects(tree_root, src: bytes) -> dict[str, "Node"]:
-    """Map `const NAME = <expr>` at any scope to <expr>'s node, for resolving
-    identifiers used as a config or schema argument."""
+def _collect_function_declarations(tree_root, src: bytes) -> dict[str, "Node"]:
+    """Map a named `function foo(...) {...}` (or `async function foo(...) {...}`)
+    declaration's name to its own node, for resolving a `handle: foo`-style
+    identifier reference to the actual function body. Same file-local,
+    ambiguous-name-safe convention as `_collect_const_objects` — a name
+    declared more than once is left out of the registry rather than guessed.
+    Deliberately not merged into that registry: a `function_declaration` has
+    no `variable_declarator` wrapper to walk."""
     registry: dict[str, "Node"] = {}
+    ambiguous: set[str] = set()
+    for n in _walk(tree_root):
+        if n.type != "function_declaration":
+            continue
+        name_node = n.child_by_field_name("name")
+        if name_node is None:
+            continue
+        name = _text(name_node, src)
+        if name in ambiguous:
+            continue
+        if name in registry and registry[name] is not n:
+            ambiguous.add(name)
+            del registry[name]
+            continue
+        registry[name] = n
+    return registry
+
+
+def _collect_const_objects(tree_root, src: bytes) -> dict[str, tuple["Node", bytes]]:
+    """Map `const NAME = <expr>` at any scope to (<expr>'s node, this file's src),
+    for resolving identifiers used as a config or schema argument. The src travels
+    with the node since a name can be resolved via the cross-file registry in
+    `find_ts_tools`, at which point it belongs to a different file's byte buffer.
+
+    Name-based, not scope-aware: if the same name is declared more than once in
+    this file (two unrelated local variables in two different functions, say),
+    there's no way to know which declaration a given reference actually means —
+    so that name is left out of the registry entirely rather than silently
+    resolved to whichever declaration happened to be walked last. An identifier
+    that isn't in the registry is left unresolved by `_resolve`, which is the
+    same safe fallback already used for a genuinely dynamic value; the risk
+    being avoided here is worse than under-reporting — resolving to the *wrong*
+    same-named variable's value and reporting it as fact.
+    """
+    registry: dict[str, tuple["Node", bytes]] = {}
+    ambiguous: set[str] = set()
     for n in _walk(tree_root):
         if n.type != "variable_declarator":
             continue
         name_node = n.child_by_field_name("name")
         value_node = n.child_by_field_name("value")
-        if name_node is not None and name_node.type == "identifier" and value_node is not None:
-            registry[_text(name_node, src)] = value_node
+        if name_node is None or name_node.type != "identifier" or value_node is None:
+            continue
+        name = _text(name_node, src)
+        if name in ambiguous:
+            continue
+        if name in registry and registry[name][0] is not value_node:
+            ambiguous.add(name)
+            del registry[name]
+            continue
+        registry[name] = (value_node, src)
     return registry
 
 
-def _resolve(node, consts: dict[str, "Node"], depth: int = 0):
+def _collect_namespace_imports(tree_root, src: bytes) -> dict[str, str]:
+    """Map each `import * as NAME from "SPEC"` namespace import's local NAME to
+    its raw module specifier, so `Object.values(NAME)` (a real pattern — a
+    module exporting one `const` per tool, collected as a namespace object and
+    turned into an array — verified against zcaceres/markdownify-mcp and
+    flesler/mcp-tasks) can be traced to the module whose exports it wraps."""
+    out: dict[str, str] = {}
+    for n in tree_root.children:
+        if n.type != "import_statement":
+            continue
+        clause = next((c for c in n.children if c.type == "import_clause"), None)
+        source_node = next((c for c in n.children if c.type == "string"), None)
+        if clause is None or source_node is None:
+            continue
+        ns = next((c for c in clause.children if c.type == "namespace_import"), None)
+        if ns is None:
+            continue
+        ident = next((c for c in ns.children if c.type == "identifier"), None)
+        spec = _string_value(source_node, src)
+        if ident is not None and spec is not None:
+            out[_text(ident, src)] = spec
+    return out
+
+
+def _object_values_arg(node) -> "Node | None":
+    """For `Object.values(X)`, return the `X` argument node, else None."""
+    if node is None or node.type != "call_expression":
+        return None
+    func = node.child_by_field_name("function")
+    if func is None or func.type != "member_expression":
+        return None
+    obj = func.child_by_field_name("object")
+    prop = func.child_by_field_name("property")
+    if obj is None or prop is None or obj.type != "identifier" or prop.type != "property_identifier":
+        return None
+    if obj.text != b"Object" or prop.text != b"values":
+        return None
+    args_node = node.child_by_field_name("arguments")
+    if args_node is None:
+        return None
+    arg_nodes = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+    return arg_nodes[0] if len(arg_nodes) == 1 and arg_nodes[0].type == "identifier" else None
+
+
+def _module_exported_consts(module_root, module_src: bytes) -> dict[str, tuple["Node", bytes]]:
+    """Top-level `export const NAME = <expr>` declarations only (not every
+    `const` anywhere in the file, unlike `_collect_const_objects`) — this is
+    what a `import * as X from "./module"` namespace object actually exposes,
+    in declaration order to match `Object.values()`'s real iteration order."""
+    out: dict[str, tuple["Node", bytes]] = {}
+    for n in module_root.children:
+        decl = n
+        if n.type == "export_statement":
+            decl = next((c for c in n.children if c.type in ("lexical_declaration", "variable_declaration")), None)
+        if decl is None or decl.type not in ("lexical_declaration", "variable_declaration"):
+            continue
+        for child in decl.children:
+            if child.type != "variable_declarator":
+                continue
+            name_node = child.child_by_field_name("name")
+            value_node = child.child_by_field_name("value")
+            if name_node is not None and name_node.type == "identifier" and value_node is not None:
+                out[_text(name_node, module_src)] = (value_node, module_src)
+    return out
+
+
+def _resolve(node, src: bytes, consts: dict[str, tuple["Node", bytes]], depth: int = 0):
+    """Resolve an identifier/member-expression/`||`-default down to a literal
+    node, returning (resolved_node, its_src) since resolution can cross files."""
     if node is None or depth > 5:
-        return node
-    if node.type == "identifier":
+        return node, src
+    if node.type in ("as_expression", "satisfies_expression"):
+        # `{ ... } as const` / `{ ... } satisfies ToolConfig` — very common on an
+        # exported tool-definition object literal; the expression being asserted
+        # is always the first child. Unwrap to keep resolving through it.
+        inner = node.children[0] if node.children else None
+        return _resolve(inner, src, consts, depth + 1) if inner is not None else (node, src)
+    if node.type in ("identifier", "shorthand_property_identifier"):
         target = consts.get(node.text.decode("utf-8", errors="ignore"))
-        return _resolve(target, consts, depth + 1) if target is not None else node
-    return node
+        if target is not None:
+            target_node, target_src = target
+            return _resolve(target_node, target_src, consts, depth + 1)
+        return node, src
+    if node.type == "binary_expression":
+        operator = node.child_by_field_name("operator")
+        # `paramName || "literal-default"` — a common optional-override-with-default
+        # idiom. The literal is the name actually used at runtime unless a caller
+        # overrides it, so resolve to that rather than treating the name as dynamic.
+        if operator is not None and operator.text == b"||":
+            right = node.child_by_field_name("right")
+            if right is not None:
+                return _resolve(right, src, consts, depth + 1)
+    if node.type == "member_expression":
+        # `fooTool.name` — a common pattern where a tool's config/schema is an
+        # exported object literal defined (often in another file) and referenced
+        # by property access at the registration call site, rather than spread
+        # or destructured. Resolve the object, then look up the property on it.
+        prop_node = node.child_by_field_name("property")
+        obj_node = node.child_by_field_name("object")
+        if prop_node is not None and prop_node.type == "property_identifier" and obj_node is not None:
+            resolved_obj, resolved_src = _resolve(obj_node, src, consts, depth + 1)
+            if resolved_obj.type == "object":
+                pairs = _object_pairs(resolved_obj, resolved_src)
+                prop_val = pairs.get(_text(prop_node, src))
+                if prop_val is not None:
+                    return _resolve(prop_val, resolved_src, consts, depth + 1)
+    if node.type == "call_expression":
+        # `allTools.filter(tool => shouldIncludeTool(tool.name))` — a common way
+        # to conditionally hide some tools from a base list at list-time. The
+        # predicate can't be evaluated statically, but filtering never invents a
+        # tool or changes its definition, only whether it's visible at runtime —
+        # so for auditing purposes, resolve straight through to the base array
+        # rather than treating the whole list as dynamic and skipping everything
+        # in it.
+        func = node.child_by_field_name("function")
+        if func is not None and func.type == "member_expression":
+            prop = func.child_by_field_name("property")
+            obj_node = func.child_by_field_name("object")
+            if prop is not None and prop.type == "property_identifier" and obj_node is not None:
+                prop_name = _text(prop, src)
+                if prop_name == "filter":
+                    return _resolve(obj_node, src, consts, depth + 1)
+                if prop_name == "parse":
+                    # `ToolSchema.parse({...})` — a common Zod idiom for
+                    # validate-and-return: the object passed in is exactly
+                    # what's registered (parse returns its argument unchanged
+                    # when valid), so resolve straight through to it rather
+                    # than treating the call as an opaque dynamic value.
+                    args_node = node.child_by_field_name("arguments")
+                    if args_node is not None:
+                        call_args = [c for c in args_node.children if c.type not in ("(", ")", ",")]
+                        if len(call_args) == 1:
+                            return _resolve(call_args[0], src, consts, depth + 1)
+                if prop_name in ("trim", "trimStart", "trimEnd"):
+                    # `` `...long description...`.trim() `` — a real, common
+                    # idiom for a multi-line template-literal description
+                    # (verified against brave/brave-search-mcp-server, where
+                    # every one of its 8 tool descriptions is declared this
+                    # way). Whitespace trimming never changes the actual
+                    # content being checked for presence/length, so resolve
+                    # straight through to the untrimmed receiver rather than
+                    # treating the whole call as an unresolvable dynamic value.
+                    return _resolve(obj_node, src, consts, depth + 1)
+    return node, src
 
 
-def _analyze_ts_tool(
-    name: str, config_or_desc, schema_arg, handler, consts: dict, src: bytes, file: str, line: int
+def _resolve_str(node, src: bytes, consts: dict[str, tuple["Node", bytes]]) -> str | None:
+    if node is None:
+        return None
+    resolved, resolved_src = _resolve(node, src, consts)
+    return _string_value(resolved, resolved_src)
+
+
+def _finding_with_description_and_param_issues(
+    name: str, file: str, line: int, description: str, param_count: int, documented: int,
+    param_doc_label: str,
 ) -> ToolFinding:
-    config_or_desc = _resolve(config_or_desc, consts)
-    schema_arg = _resolve(schema_arg, consts) if schema_arg is not None else None
-
-    if config_or_desc is not None and config_or_desc.type == "object":
-        pairs = _object_pairs(config_or_desc, src)
-        description = _string_value(pairs.get("description"), src) or ""
-        if schema_arg is None:
-            # registerTool uses inputSchema; fastmcp's addTool uses parameters.
-            schema_key = pairs.get("inputSchema") or pairs.get("parameters")
-            if schema_key is not None:
-                schema_arg = _resolve(schema_key, consts)
-    else:
-        description = _string_value(config_or_desc, src) or ""
-
-    zod_obj = _zod_object_arg(schema_arg) if schema_arg is not None else None
-    props = _object_pairs(zod_obj, src) if zod_obj is not None else {}
-    param_count = len(props)
-    documented = sum(1 for v in props.values() if _has_describe_call(v))
-
-    has_try = _find_try(handler) if handler is not None else False
-
+    """Build a ToolFinding with the description/param-docs issues that are common
+    across every TS registration style. Caller fills in and appends the
+    error_handling issue (or omits it), since not every style has a per-tool
+    handler to inspect for one."""
     finding = ToolFinding(
         name=name,
         file=file,
         line=line,
         has_description=bool(description.strip()),
         description_len=len(description.strip()),
+        description_display_width=description_display_width(description.strip()),
         param_count=param_count,
-        typed_param_count=param_count,  # Zod schemas are typed by construction
+        typed_param_count=param_count,
         has_docstring_params=documented >= param_count and param_count > 0,
-        has_try_except=has_try,
+        has_try_except=True,
         has_bare_except=False,
+        description_text=description,
     )
 
     if not finding.has_description:
@@ -195,7 +515,7 @@ def _analyze_ts_tool(
             "Tool has no description. An agent cannot decide when to call this.",
             "error",
         ))
-    elif finding.description_len < 10:
+    elif finding.description_display_width < 10:
         finding.issues.append(ToolIssue(
             name, file, line, "description",
             f"Description is only {finding.description_len} chars — likely just restates the name.",
@@ -205,10 +525,42 @@ def _analyze_ts_tool(
     if param_count and not finding.has_docstring_params:
         finding.issues.append(ToolIssue(
             name, file, line, "param_docs",
-            f"{param_count - documented}/{param_count} Zod schema properties have no .describe(...) — "
+            f"{param_count - documented}/{param_count} {param_doc_label} — "
             "the model only sees names, not intent.",
             "warning",
         ))
+
+    return finding
+
+
+def _analyze_ts_tool(
+    name: str, config_or_desc, config_src: bytes, schema_arg, schema_src: bytes,
+    handler, consts: dict, file: str, line: int
+) -> ToolFinding:
+    if config_or_desc is not None and config_or_desc.type == "object":
+        pairs = _object_pairs(config_or_desc, config_src)
+        description = _resolve_str(pairs.get("description"), config_src, consts) or ""
+        if schema_arg is None:
+            # registerTool uses inputSchema; fastmcp's addTool uses parameters;
+            # the defineTool/definePageTool wrapper style uses schema.
+            schema_key = pairs.get("inputSchema") or pairs.get("parameters") or pairs.get("schema")
+            if schema_key is not None:
+                schema_arg, schema_src = _resolve(schema_key, config_src, consts)
+    else:
+        description = _string_value(config_or_desc, config_src) or ""
+
+    zod_obj = _zod_object_arg(schema_arg) if schema_arg is not None else None
+    props = _object_pairs(zod_obj, schema_src) if zod_obj is not None else {}
+    param_count = len(props)
+    documented = sum(1 for v in props.values() if _has_describe_call(v, schema_src, consts))
+
+    has_try = _find_try(handler) if handler is not None else False
+
+    finding = _finding_with_description_and_param_issues(
+        name, file, line, description, param_count, documented,
+        "Zod schema properties have no .describe(...)",
+    )
+    finding.has_try_except = has_try
 
     if handler is not None and not has_try:
         finding.issues.append(ToolIssue(
@@ -220,6 +572,58 @@ def _analyze_ts_tool(
         ))
 
     return finding
+
+
+def _analyze_json_schema_tool(
+    name: str, desc_node, schema_node, schema_src: bytes, consts: dict, src: bytes, file: str, line: int
+) -> ToolFinding:
+    """For the low-level `Server` SDK's `setRequestHandler(ListToolsRequestSchema, ...)`
+    style: tools are plain `Tool` objects (raw JSON Schema, not Zod) returned from
+    a static or const-referenced array, not individual `registerTool`/`.tool()`
+    call sites. There's no per-tool handler closure to inspect for a try/catch —
+    a single generic dispatcher (keyed by name, often proxying to a different
+    process entirely, as with a Chrome-extension-backed server) serves every
+    tool — so error_handling is deliberately not checked for this style."""
+    description = _resolve_str(desc_node, src, consts) or ""
+
+    schema, resolved_schema_src = (
+        _resolve(schema_node, schema_src, consts) if schema_node is not None else (None, schema_src)
+    )
+
+    param_count = 0
+    documented = 0
+    param_doc_label = "JSON-schema properties have no description"
+
+    if schema is not None and schema.type == "object":
+        properties_node = _object_pairs(schema, resolved_schema_src).get("properties")
+        if properties_node is not None:
+            resolved_props, resolved_props_src = _resolve(properties_node, resolved_schema_src, consts)
+            if resolved_props.type == "object":
+                props = _object_pairs(resolved_props, resolved_props_src)
+                param_count = len(props)
+                for v in props.values():
+                    v_resolved, v_resolved_src = _resolve(v, resolved_props_src, consts)
+                    if v_resolved.type == "object":
+                        prop_desc = _object_pairs(v_resolved, v_resolved_src).get("description")
+                        if _string_value(prop_desc, v_resolved_src):
+                            documented += 1
+    elif schema is not None and schema.type == "call_expression":
+        # `inputSchema: zodToJsonSchema(SomeArgsSchema)` — the well-known
+        # zod-to-json-schema package, used to keep one Zod schema as the single
+        # source of truth while serving raw JSON Schema over the low-level SDK.
+        # Unwrap to the underlying Zod schema so param docs are still checked,
+        # rather than going blind on every tool that uses this (common) idiom.
+        zod_node, zod_src = _zod_wrapped_schema(schema, resolved_schema_src, consts)
+        zod_obj = _zod_object_arg(zod_node)
+        if zod_obj is not None:
+            zod_props = _object_pairs(zod_obj, zod_src)
+            param_count = len(zod_props)
+            documented = sum(1 for v in zod_props.values() if _has_describe_call(v, zod_src, consts))
+            param_doc_label = "Zod schema properties have no .describe(...)"
+
+    return _finding_with_description_and_param_issues(
+        name, file, line, description, param_count, documented, param_doc_label,
+    )
 
 
 def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
@@ -242,12 +646,20 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
         if any(part in skip_dirs or part.startswith(".") for part in rel_parts):
             continue
         stem = p.stem.lower()
-        if "test" in stem or "spec" in stem or "__tests__" in rel_parts:
+        # Directory-based exclusion matches the Python analyzer's `_is_auxiliary_file`
+        # (any "test"/"tests" path segment) — verified against a real miss:
+        # mcp-use/mcp-use's `libraries/typescript/packages/agent/tests/servers/
+        # simple_server.ts`, a genuine test fixture ("Minimal stdio MCP server
+        # ... for agent integration tests") whose filename stem alone
+        # (`simple_server`) and directory (`tests`, not Jest's `__tests__`)
+        # both slipped past the old check.
+        if "test" in stem or "spec" in stem or any(part in ("test", "tests", "__tests__") for part in rel_parts):
             continue
         files.append(p)
 
     findings: list[ToolFinding] = []
     unparseable: list[str] = []
+    parsed: list[tuple[Path, "Node", bytes]] = []
 
     for f in files:
         try:
@@ -256,28 +668,194 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
             continue
         parser = tsx_parser if f.suffix == ".tsx" else ts_parser
         tree = parser.parse(src)
-        rel = str(f.relative_to(root))
-        consts = _collect_const_objects(tree.root_node, src)
+        parsed.append((f, tree.root_node, src))
 
-        for node in _walk(tree.root_node):
+    # Repo-wide, name-based registry of `const NAME = {...}` object literals, so
+    # a tool's name/config can be resolved even when it's referenced from another
+    # file (e.g. `server.registerTool(fooTool.name, ...)` where `fooTool` is
+    # exported from a different module and re-exported through a barrel file).
+    # Name-based, not full import-resolved — same simplification already used
+    # for the Python side's cross-file Field-alias registry.
+    global_consts: dict[str, tuple["Node", bytes]] = {}
+    for _f, file_root, file_src in parsed:
+        for const_name, entry in _collect_const_objects(file_root, file_src).items():
+            global_consts.setdefault(const_name, entry)
+
+    # Maps each file's src buffer (by identity — buffers are never copied, only
+    # passed around by reference through resolution) back to its relative path,
+    # so a tool object resolved from a static array can be reported at its own
+    # definition site rather than the (possibly different-file) call site.
+    src_to_rel: dict[int, str] = {id(s): str(f.relative_to(root)) for f, _, s in parsed}
+    seen_list_tools: set[tuple[str, str, int]] = set()
+
+    # Resolves a relative `import * as X from "./spec"` module specifier to the
+    # parsed file it refers to, tolerating the common TS-emits-.js-imports-for-
+    # .ts-source mismatch by comparing paths with their suffix stripped.
+    by_module_path: dict[Path, tuple[Path, "Node", bytes]] = {
+        f.with_suffix(""): (f, file_root, file_src) for f, file_root, file_src in parsed
+    }
+    module_exports_cache: dict[Path, dict[str, tuple["Node", bytes]]] = {}
+
+    def _resolve_namespace_module(current_file: Path, spec: str):
+        if not spec.startswith("."):
+            return None  # only same-repo relative imports are traceable
+        target = (current_file.parent / spec).resolve().with_suffix("")
+        return by_module_path.get(target)
+
+    for f, file_root, src in parsed:
+        rel = str(f.relative_to(root))
+        local_consts = _collect_const_objects(file_root, src)
+        consts = {**global_consts, **local_consts}
+        local_funcs = _collect_function_declarations(file_root, src)
+        namespace_imports = _collect_namespace_imports(file_root, src)
+
+        for node in _walk(file_root):
+            if node.type == "variable_declarator":
+                # A bare (no wrapping call) typed const tool object, e.g.
+                # `const navigateTool: Tool<typeof NavigateInputSchema> = {
+                #   capability: "core", schema: { name, description, inputSchema },
+                #   handle: handleNavigate,
+                # }` — verified against browserbase/mcp-server-browserbase, whose
+                # own MCP-SDK registration site (`server.tool(tool.schema.name,
+                # ...)`) is a runtime `.forEach()` over a collected array with only
+                # property-accessed args, genuinely unresolvable there. The
+                # `schema`+`handle` sibling-field combination is distinctive
+                # enough to trust without needing a project-specific type name
+                # (the `Tool<...>` annotation varies per project) — requiring a
+                # resolvable literal `schema.name` keeps a same-named-but-
+                # unrelated object from being mistaken for one.
+                value_node = node.child_by_field_name("value")
+                if value_node is None or value_node.type != "object":
+                    continue
+                outer_pairs = _object_pairs(value_node, src)
+                schema_field = outer_pairs.get("schema")
+                handle_field = outer_pairs.get("handle")
+                if schema_field is None or handle_field is None:
+                    continue
+                schema_obj, schema_src = _resolve(schema_field, src, consts)
+                if schema_obj.type != "object":
+                    continue
+                schema_pairs = _object_pairs(schema_obj, schema_src)
+                if "name" not in schema_pairs:
+                    continue  # not this shape — a same-named unrelated object
+                name_val = _resolve_str(schema_pairs.get("name"), schema_src, consts)
+                if name_val is None:
+                    continue  # dynamic tool name — can't attribute a finding to it
+                handler = handle_field
+                if handler.type == "identifier":
+                    handler = local_funcs.get(_text(handler, src))
+                elif handler.type not in ("arrow_function", "function_expression"):
+                    handler = None
+                finding = _analyze_ts_tool(
+                    name_val, schema_obj, schema_src, None, schema_src, handler, consts,
+                    rel, node.start_point[0] + 1,
+                )
+                findings.append(finding)
+                continue
             if node.type != "call_expression":
                 continue
             method = _callee_name(node)
-            if method not in REGISTER_METHODS and method not in SINGLE_OBJECT_METHODS:
+            if (
+                method not in REGISTER_METHODS
+                and method not in SINGLE_OBJECT_METHODS
+                and method not in WRAPPER_FACTORY_METHODS
+                and method != LIST_TOOLS_METHOD
+            ):
                 continue
             args_node = node.child_by_field_name("arguments")
             if args_node is None:
                 continue
             arg_nodes = [c for c in args_node.children if c.type not in ("(", ")", ",")]
 
+            if method == LIST_TOOLS_METHOD:
+                if len(arg_nodes) < 2 or arg_nodes[0].type != "identifier":
+                    continue
+                if _text(arg_nodes[0], src) != LIST_TOOLS_SCHEMA:
+                    continue
+                tools_array_raw = _find_tools_array(arg_nodes[1], src)
+                if tools_array_raw is None:
+                    continue
+
+                # `Object.values(tools)` where `tools` is a namespace import
+                # (`import * as tools from "./tools.js"`) — the module it
+                # points at exports one `const` object per tool rather than a
+                # single array, so its elements come from that module's own
+                # top-level exports instead of `_collect_tool_array_elements`.
+                ns_arg = _object_values_arg(tools_array_raw)
+                tool_elements: list[tuple["Node", bytes]] = []
+                if ns_arg is not None:
+                    spec = namespace_imports.get(_text(ns_arg, src))
+                    module_entry = _resolve_namespace_module(f, spec) if spec else None
+                    if module_entry is not None:
+                        mod_path, mod_root, mod_src = module_entry
+                        mod_exports = module_exports_cache.get(mod_path)
+                        if mod_exports is None:
+                            mod_exports = _module_exported_consts(mod_root, mod_src)
+                            module_exports_cache[mod_path] = mod_exports
+                        for value_node, value_src in mod_exports.values():
+                            resolved_val, resolved_val_src = _resolve(value_node, value_src, consts)
+                            if resolved_val.type == "object":
+                                tool_elements.append((resolved_val, resolved_val_src))
+                else:
+                    tools_array, tools_array_src = _resolve(tools_array_raw, src, consts)
+                    tool_elements = _collect_tool_array_elements(tools_array, tools_array_src, consts)
+
+                for tool_obj, tool_src in tool_elements:
+                    pairs = _object_pairs(tool_obj, tool_src)
+                    name_val = _resolve_str(pairs.get("name"), tool_src, consts)
+                    if name_val is None:
+                        continue  # dynamic tool name — can't attribute a finding to it
+                    tool_file = src_to_rel.get(id(tool_src), rel)
+                    tool_line = tool_obj.start_point[0] + 1
+                    # The same static tool list is commonly wired into more than
+                    # one setRequestHandler call site (e.g. separate stdio/HTTP
+                    # transport entrypoints) — dedupe by the tool's own
+                    # definition, not the call site, so it's reported once.
+                    dedup_key = (name_val, tool_file, tool_line)
+                    if dedup_key in seen_list_tools:
+                        continue
+                    seen_list_tools.add(dedup_key)
+                    findings.append(
+                        _analyze_json_schema_tool(
+                            name_val, pairs.get("description"), pairs.get("inputSchema"), tool_src,
+                            consts, tool_src, tool_file, tool_line,
+                        )
+                    )
+                continue
+
+            if method in WRAPPER_FACTORY_METHODS:
+                if len(arg_nodes) != 1:
+                    continue
+                definition, definition_src = _extract_definition_object(arg_nodes[0], src)
+                if definition is None:
+                    continue
+                definition, definition_src = _resolve(definition, definition_src, consts)
+                if definition.type != "object":
+                    continue
+                pairs = _object_pairs(definition, definition_src)
+                name_val = _resolve_str(pairs.get("name"), definition_src, consts)
+                if name_val is None:
+                    continue  # dynamic tool name — can't attribute a finding to it
+                handler_val = pairs.get("handler")
+                handler = handler_val if handler_val is not None and handler_val.type in (
+                    "arrow_function", "function_expression"
+                ) else None
+                findings.append(
+                    _analyze_ts_tool(
+                        name_val, definition, definition_src, None, definition_src, handler, consts,
+                        rel, node.start_point[0] + 1,
+                    )
+                )
+                continue
+
             if method in SINGLE_OBJECT_METHODS:
                 if len(arg_nodes) != 1:
                     continue
-                config = _resolve(arg_nodes[0], consts)
+                config, config_src = _resolve(arg_nodes[0], src, consts)
                 if config.type != "object":
                     continue
-                pairs = _object_pairs(config, src)
-                name_val = _string_value(_resolve(pairs.get("name"), consts), src)
+                pairs = _object_pairs(config, config_src)
+                name_val = _resolve_str(pairs.get("name"), config_src, consts)
                 if name_val is None:
                     continue  # dynamic tool name — can't attribute a finding to it
                 handler_val = pairs.get("execute")
@@ -285,22 +863,32 @@ def find_ts_tools(root: Path) -> tuple[list[ToolFinding], list[str]]:
                     "arrow_function", "function_expression"
                 ) else None
                 findings.append(
-                    _analyze_ts_tool(name_val, config, None, handler, consts, src, rel, node.start_point[0] + 1)
+                    _analyze_ts_tool(
+                        name_val, config, config_src, None, config_src, handler, consts,
+                        rel, node.start_point[0] + 1,
+                    )
                 )
                 continue
 
             if len(arg_nodes) < 3:
                 continue
-            name_val = _string_value(_resolve(arg_nodes[0], consts), src)
+            name_val = _resolve_str(arg_nodes[0], src, consts)
             if name_val is None:
                 continue  # dynamic tool name — can't attribute a finding to it
             handler = arg_nodes[-1] if arg_nodes[-1].type in ("arrow_function", "function_expression") else None
-            if method == "registerTool":
-                config, schema = arg_nodes[1], None
+            if method in ("registerTool", "accountTool"):
+                config_raw, schema_raw = arg_nodes[1], None
             else:  # "tool": name, description, schema, handler
-                config, schema = arg_nodes[1], arg_nodes[2] if len(arg_nodes) >= 4 else None
+                config_raw, schema_raw = arg_nodes[1], arg_nodes[2] if len(arg_nodes) >= 4 else None
+            config, config_src = _resolve(config_raw, src, consts)
+            schema_arg, schema_src = (
+                _resolve(schema_raw, src, consts) if schema_raw is not None else (None, src)
+            )
             findings.append(
-                _analyze_ts_tool(name_val, config, schema, handler, consts, src, rel, node.start_point[0] + 1)
+                _analyze_ts_tool(
+                    name_val, config, config_src, schema_arg, schema_src, handler, consts,
+                    rel, node.start_point[0] + 1,
+                )
             )
 
     return findings, unparseable

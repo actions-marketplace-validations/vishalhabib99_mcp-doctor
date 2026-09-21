@@ -34,7 +34,7 @@ def test_fastmcp_tool_with_full_docs_passes_clean(tmp_path):
         """)
     (tmp_path / "README.md").write_text("# x\n\nHas get_forecast tool.")
     (tmp_path / "LICENSE").write_text("MIT")
-    (tmp_path / "requirements.txt").write_text("mcp\n")
+    (tmp_path / "requirements.txt").write_text("mcp==1.0.0\n")
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_x.py").write_text("def test_x(): pass")
 
@@ -82,6 +82,184 @@ def test_bare_except_is_an_error(tmp_path):
     assert bare_issue.severity == "error"
 
 
+def test_delegation_to_handled_helper_same_file_clears_error_handling(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def do_work(x):
+            try:
+                return 1 / x
+            except ZeroDivisionError:
+                return 0
+
+        @mcp.tool()
+        def divide(x: int) -> int:
+            \"\"\"Divide.
+
+            Args:
+                x: The divisor.
+            \"\"\"
+            return do_work(x)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" not in checks
+
+
+def test_delegation_to_handled_helper_multi_hop_cross_file_clears_error_handling(tmp_path):
+    # Mirrors the real pattern found dogfooding against tradingview-mcp:
+    # tool -> service function -> fetch function -> the function with the
+    # actual try/except, three calls deep and across two files.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from service import analyze_sentiment
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def market_sentiment(symbol: str) -> dict:
+            \"\"\"Sentiment for a symbol.
+
+            Args:
+                symbol: The ticker.
+            \"\"\"
+            return analyze_sentiment(symbol)
+        """)
+    write(tmp_path, "service.py", """
+        def analyze_sentiment(symbol):
+            articles = _get_articles(symbol)
+            return {"symbol": symbol, "articles": articles}
+
+        def _get_articles(symbol):
+            return _request(symbol)
+
+        def _request(symbol):
+            try:
+                return fetch(symbol)
+            except Exception:
+                return None
+        """)
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "market_sentiment")
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" not in checks
+
+
+def test_delegation_through_method_call_clears_error_handling(tmp_path):
+    # Mirrors the real pattern found dogfooding MODSetter/SurfSense: a tool
+    # calls a bare helper function, which delegates to an object *method*
+    # (`client.request(...)`) rather than another bare function — the actual
+    # try/except lives inside that method. All 28 of the repo's real tools
+    # used this shape and were false-flagged before method calls were
+    # resolved, since only bare-name calls (`foo(...)`) were followed.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from service import run_scraper
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def scrape(query: str) -> str:
+            \"\"\"Scrape something.
+
+            Args:
+                query: The search query.
+            \"\"\"
+            return run_scraper(query)
+        """)
+    write(tmp_path, "service.py", """
+        class Client:
+            def request(self, query):
+                try:
+                    return {"query": query}
+                except Exception:
+                    return {}
+
+        def run_scraper(query):
+            client = Client()
+            return client.request(query)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "scrape")
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" not in checks
+
+
+def test_delegation_through_aliased_import_clears_error_handling(tmp_path):
+    # Mirrors the real pattern found dogfooding against tradingview-mcp:
+    # `from strategies import compare_strategies as _compare_strategies`,
+    # called at the tool site as `_compare_strategies(...)`.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        from strategies import compare_strategies as _compare_strategies
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def compare(symbol: str) -> dict:
+            \"\"\"Compare strategies.
+
+            Args:
+                symbol: The ticker.
+            \"\"\"
+            return _compare_strategies(symbol)
+        """)
+    write(tmp_path, "strategies.py", """
+        def compare_strategies(symbol):
+            try:
+                return {"symbol": symbol}
+            except Exception:
+                return {}
+        """)
+    report = analyze_repo(tmp_path)
+    tool = next(t for t in report.tools if t.name == "compare")
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" not in checks
+
+
+def test_delegation_to_unhandled_helper_still_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def do_work(x):
+            return 1 / x
+
+        @mcp.tool()
+        def divide(x: int) -> int:
+            \"\"\"Divide.
+
+            Args:
+                x: The divisor.
+            \"\"\"
+            return do_work(x)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" in checks
+
+
+def test_delegation_to_external_call_still_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        import requests
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def fetch_url(url: str) -> str:
+            \"\"\"Fetch a URL.
+
+            Args:
+                url: The URL.
+            \"\"\"
+            return requests.get(url).text
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "error_handling" in checks
+
+
 def test_lowlevel_tool_constructor_detected(tmp_path):
     write(tmp_path, "server.py", """
         from mcp.types import Tool
@@ -105,6 +283,129 @@ def test_lowlevel_tool_constructor_detected(tmp_path):
     assert report.tools[0].issues == []
 
 
+def test_lowlevel_tool_with_dynamic_name_is_skipped_not_unnamed(tmp_path):
+    # A common class-based tool framework: a registry of tool objects, converted
+    # to Tool(...) constructor calls in a loop. The name isn't a string literal,
+    # so it can't be attributed to a single finding — must be skipped entirely,
+    # not misreported as a fabricated "<unnamed>" tool.
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+
+        TOOLS = {"chat": ChatTool()}
+
+        def handle_list_tools():
+            tools = []
+            for tool in TOOLS.values():
+                tools.append(
+                    Tool(
+                        name=tool.name,
+                        description=tool.description,
+                        inputSchema=tool.get_input_schema(),
+                    )
+                )
+            return tools
+        """)
+    report = analyze_repo(tmp_path)
+    assert report.tools == []
+
+
+def test_lowlevel_tool_property_from_zero_arg_builder_counts_as_documented(tmp_path):
+    # `"paper_id": _paper_id_property()` — a schema property built by a
+    # shared zero-arg helper rather than written inline — verified against
+    # blazickjp/arxiv-mcp-server's `_paper_id_property`. The helper's own
+    # dict literal has a description; that should count, not be reported as
+    # undocumented just because it's a call rather than a literal.
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+
+        def _paper_id_property():
+            return {"type": "string", "description": "Validated arXiv paper ID"}
+
+        TOOLS = [
+            Tool(
+                name="get_paper",
+                description="Get a paper by its arXiv ID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "paper_id": _paper_id_property(),
+                    },
+                },
+            )
+        ]
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "param_docs" for i in tool.issues)
+
+
+def test_lowlevel_tool_spread_properties_from_zero_arg_builder_expanded(tmp_path):
+    # `**_page_properties()` — several properties spread in from a shared
+    # helper, rather than counted as one opaque, always-undocumented
+    # property (the pre-fix behavior: **spread's key is None, so it never
+    # matched the inline-dict check at all).
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+
+        def _page_properties():
+            return {
+                "start": {"type": "integer", "description": "Offset"},
+                "max_chars": {"type": "integer", "description": "Limit"},
+                "return_full_text": {"type": "boolean"},
+            }
+
+        TOOLS = [
+            Tool(
+                name="read_section",
+                description="Read part of a paper section.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "section_id": {"type": "string", "description": "Section id"},
+                        **_page_properties(),
+                    },
+                },
+            )
+        ]
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.param_count == 4
+    assert tool.typed_param_count == 3
+    docs_issue = next(i for i in tool.issues if i.check == "param_docs")
+    assert "1/4" in docs_issue.message
+
+
+def test_lowlevel_tool_property_from_parameterized_call_not_guessed(tmp_path):
+    # A property built by a call that takes arguments isn't safely
+    # resolvable without evaluating it with the right arguments — correctly
+    # left as an opaque, undocumented property rather than guessed at.
+    write(tmp_path, "server.py", """
+        from mcp.types import Tool
+
+        def _string_property(desc):
+            return {"type": "string", "description": desc}
+
+        TOOLS = [
+            Tool(
+                name="get_paper",
+                description="Get a paper by its arXiv ID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "paper_id": _string_property("Validated arXiv paper ID"),
+                    },
+                },
+            )
+        ]
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.param_count == 1
+    assert tool.typed_param_count == 0
+    assert any(i.check == "param_docs" for i in tool.issues)
+
+
 def test_unparseable_file_is_flagged_not_silently_skipped(tmp_path):
     write(tmp_path, "server.py", """
         def broken(
@@ -119,6 +420,102 @@ def test_no_tools_found_gives_empty_report(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)
     assert report.tools == []
+
+
+def test_class_based_tool_detected_with_name_from_class_and_class_docstring(tmp_path):
+    # oraios/serena's own shape: no decorator, no Tool(...) constructor — the
+    # tool name is derived from the class name and the description from the
+    # class's own docstring, not `apply`'s.
+    write(tmp_path, "server.py", """
+        class ReadFileTool(Tool):
+            \"\"\"Reads a file within the project directory.\"\"\"
+
+            def apply(self, relative_path: str, start_line: int = 0) -> str:
+                \"\"\"
+                Reads the given file or a chunk of it.
+
+                :param relative_path: the relative path to the file to read
+                :param start_line: the 0-based index of the first line to retrieve
+                \"\"\"
+                try:
+                    return relative_path
+                except OSError as e:
+                    return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+    tool = report.tools[0]
+    assert tool.name == "read_file"
+    assert tool.description_text == "Reads a file within the project directory."
+    assert tool.issues == []
+
+
+def test_class_based_tool_without_apply_method_is_not_a_tool(tmp_path):
+    write(tmp_path, "server.py", """
+        class ToolMarker:
+            \"\"\"Not a real tool — a marker base class, no apply() method.\"\"\"
+        """)
+    report = analyze_repo(tmp_path)
+    assert report.tools == []
+
+
+def test_class_based_tool_with_no_class_docstring_falls_back_to_apply_docstring(tmp_path):
+    # Verified against serena's own src/serena/mcp.py: `func_doc =
+    # tool.get_apply_docstring() or ""` is passed straight into
+    # `description=` at tool-registration time — the *class* docstring is
+    # never read there. Real tools like SearchForPatternTool and
+    # SafeDeleteSymbol only ever docstring the apply() method, never the
+    # class itself, and are genuinely described to the agent at runtime.
+    write(tmp_path, "server.py", """
+        class SearchForPatternTool(Tool):
+            def apply(self, substring_pattern: str) -> str:
+                \"\"\"
+                Searches for a pattern.
+
+                :param substring_pattern: the pattern
+                \"\"\"
+                return substring_pattern
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.description_text == "Searches for a pattern."
+    assert not any(i.check == "description" for i in tool.issues)
+
+
+def test_class_based_tool_with_no_docstring_anywhere_flags_missing_description(tmp_path):
+    write(tmp_path, "server.py", """
+        class SearchForPatternTool(Tool):
+            def apply(self, substring_pattern: str) -> str:
+                return substring_pattern
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.description_text == ""
+    assert any(i.check == "description" for i in tool.issues)
+
+
+def test_sphinx_style_param_docs_recognized_for_decorator_tool(tmp_path):
+    # :param name: ... (reST/Sphinx style) is a distinct, real convention from
+    # the Google-style `Args:` section already supported — no heading needed.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str, days: int) -> str:
+            \"\"\"Get a weather forecast.
+
+            :param city: the city name
+            :param int days: how many days out
+            \"\"\"
+            try:
+                return f"{city} {days}"
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "param_docs" for i in tool.issues)
 
 
 def test_hardcoded_secret_flagged(tmp_path):
@@ -268,6 +665,85 @@ def test_cross_file_field_alias_counts_as_param_docs(tmp_path):
     assert "param_docs" not in checks
 
 
+def test_exclude_args_param_not_required_to_be_documented(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Any
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool(exclude_args=["extractor"])
+        def search_posts(keywords: str, extractor: Any | None = None) -> str:
+            \"\"\"Search posts.
+
+            Args:
+                keywords: Search keywords.
+            \"\"\"
+            try:
+                return keywords
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+    assert tool.param_count == 1
+
+
+def test_context_param_not_required_to_be_documented(tmp_path):
+    # Found dogfooding CursorTouch/Windows-MCP: FastMCP injects a Context-typed
+    # parameter at call time and strips it from the tool's exposed schema
+    # before it's ever built (verified against fastmcp's own
+    # function_parsing.py, without_injected_parameters) — same treatment as
+    # self/cls, without needing an explicit exclude_args entry. Every one of
+    # the target repo's tools had this param, and every one was false-flagged
+    # for "undocumented" because of it, even when every real param had a
+    # Field(description=...).
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from fastmcp import Context
+        from mcp.server.fastmcp import FastMCP
+        from pydantic import Field
+        mcp = FastMCP("x")
+
+        @mcp.tool(name="Notification")
+        def notification_tool(
+            title: Annotated[str, Field(description="The notification title.")],
+            ctx: Context = None,
+        ) -> str:
+            return title
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" not in checks
+    assert tool.param_count == 1
+
+
+def test_undocumented_non_excluded_param_still_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Any
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool(exclude_args=["extractor"])
+        def search_posts(keywords: str, note: str, extractor: Any | None = None) -> str:
+            \"\"\"Search posts.
+
+            Args:
+                keywords: Search keywords.
+            \"\"\"
+            try:
+                return keywords
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    checks = {i.check for i in tool.issues}
+    assert "param_docs" in checks
+
+
 def test_bold_bulleted_parameters_heading_recognized(tmp_path):
     write(tmp_path, "server.py", """
         from mcp.server.fastmcp import FastMCP
@@ -337,6 +813,113 @@ def test_duplicate_tool_names_flagged(tmp_path):
     assert "dupe" in issue.message
 
 
+def test_mounted_namespace_tools_not_flagged_as_duplicate(tmp_path):
+    write(tmp_path, "jira.py", """
+        from mcp.server.fastmcp import FastMCP
+        jira_mcp = FastMCP("jira")
+
+        @jira_mcp.tool()
+        def search() -> str:
+            \"\"\"Search Jira issues.\"\"\"
+            try:
+                return "a"
+            except ValueError as e:
+                return str(e)
+        """)
+    write(tmp_path, "confluence.py", """
+        from mcp.server.fastmcp import FastMCP
+        confluence_mcp = FastMCP("confluence")
+
+        @confluence_mcp.tool()
+        def search() -> str:
+            \"\"\"Search Confluence pages.\"\"\"
+            try:
+                return "a"
+            except ValueError as e:
+                return str(e)
+        """)
+    write(tmp_path, "main.py", """
+        from mcp.server.fastmcp import FastMCP
+        from .jira import jira_mcp
+        from .confluence import confluence_mcp
+
+        main_mcp = FastMCP("main")
+        main_mcp.mount(jira_mcp, namespace="jira")
+        main_mcp.mount(confluence_mcp, namespace="confluence")
+        """)
+    report = analyze_repo(tmp_path)
+    dup_issues = [i for i in report.repo_issues if i.check == "tool_name" and "unique" in i.message]
+    assert not dup_issues
+    names = {t.name for t in report.tools}
+    assert "jira_search" in names
+    assert "confluence_search" in names
+
+
+def test_standalone_entrypoint_files_not_compared_for_duplicates(tmp_path):
+    write(tmp_path, "main_server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("real")
+
+        @mcp.tool()
+        def create_object() -> str:
+            \"\"\"Create a real object.\"\"\"
+            try:
+                return "a"
+            except ValueError as e:
+                return str(e)
+
+        if __name__ == "__main__":
+            mcp.run()
+        """)
+    write(tmp_path, "scratch_mcp.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("scratch")
+
+        @mcp.tool()
+        def create_object() -> str:
+            \"\"\"Scratch reimplementation for local testing.\"\"\"
+            try:
+                return "b"
+            except ValueError as e:
+                return str(e)
+
+        if __name__ == "__main__":
+            mcp.run()
+        """)
+    report = analyze_repo(tmp_path)
+    dup_issues = [i for i in report.repo_issues if i.check == "tool_name" and "unique" in i.message]
+    assert not dup_issues
+
+
+def test_real_duplicate_within_standalone_entrypoint_still_flagged(tmp_path):
+    write(tmp_path, "scratch_mcp.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("scratch")
+
+        @mcp.tool(name="dupe")
+        def a() -> str:
+            \"\"\"First.\"\"\"
+            try:
+                return "a"
+            except ValueError as e:
+                return str(e)
+
+        @mcp.tool(name="dupe")
+        def b() -> str:
+            \"\"\"Second.\"\"\"
+            try:
+                return "b"
+            except ValueError as e:
+                return str(e)
+
+        if __name__ == "__main__":
+            mcp.run()
+        """)
+    report = analyze_repo(tmp_path)
+    issue = next(i for i in report.repo_issues if i.check == "tool_name" and "unique" in i.message)
+    assert "dupe" in issue.message
+
+
 def test_valid_tool_name_not_flagged(tmp_path):
     write(tmp_path, "server.py", """
         from mcp.server.fastmcp import FastMCP
@@ -358,12 +941,265 @@ def test_valid_tool_name_not_flagged(tmp_path):
     assert not any(i.check == "tool_name" for i in report.repo_issues)
 
 
+def test_direct_call_tool_resolved_via_same_name_function(tmp_path):
+    # `provider.tool(get_forecast, name="...")` — the plain, unaliased case:
+    # the registered function is literally the def it names, no reassignment
+    # to trace at all. One of FastMCP's own documented `.tool()` calling
+    # patterns ("direct function call"), distinct from decorator use.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+
+        mcp.tool(get_forecast, name="get_forecast", description="Get a weather forecast for a city.")
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.name == "get_forecast"
+    assert tool.description_text == "Get a weather forecast for a city."
+    assert tool.param_count == 1
+    assert not any(i.check == "param_docs" for i in tool.issues)
+
+
+def test_direct_call_tool_resolved_via_single_reassignment(tmp_path):
+    # `find_foo = find` (one unconditional rename), then registered as
+    # `find_foo` — still safely resolvable back to `find`'s own definition.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def setup():
+            def find(query: str) -> str:
+                \"\"\"Find things.
+
+                Args:
+                    query: What to search for.
+                \"\"\"
+                try:
+                    return query
+                except ValueError as e:
+                    return str(e)
+
+            find_foo = find
+            mcp.tool(find_foo, name="qdrant-find", description="Find memories.")
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.name == "qdrant-find"
+    assert tool.param_count == 1
+    assert not any(i.check == "param_docs" for i in tool.issues)
+
+
+def test_direct_call_tool_with_ambiguous_reassignment_not_guessed(tmp_path):
+    # `find_foo` is reassigned again through a wrapping call before
+    # registration (a common way to conditionally post-process a tool
+    # function — verified against qdrant/mcp-server-qdrant) — which branch
+    # actually runs depends on runtime config, so this is correctly left
+    # unresolved: name/description are still checked, but params aren't
+    # guessed at from the wrong (or right) branch.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def setup():
+            def find(query: str) -> str:
+                \"\"\"Find things.
+
+                Args:
+                    query: What to search for.
+                \"\"\"
+                try:
+                    return query
+                except ValueError as e:
+                    return str(e)
+
+            find_foo = find
+            if some_condition:
+                find_foo = wrap_filters(find_foo)
+            mcp.tool(find_foo, name="qdrant-find", description="Find memories.")
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.name == "qdrant-find"
+    assert tool.description_text == "Find memories."
+    assert tool.param_count == 0
+    assert not any(i.check == "param_docs" for i in tool.issues)
+
+
+def test_direct_call_tool_with_non_literal_description_not_guessed(tmp_path):
+    # `description=self.tool_settings.tool_find_description` — a settings
+    # attribute reference, not a literal string — combined with an
+    # unresolvable registered function (no docstring to fall back on
+    # either). Correctly left with no description at all rather than
+    # chasing the attribute back through a Settings class's Field default.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        def setup():
+            def find(query: str) -> str:
+                return query
+
+            find_foo = find
+            if some_condition:
+                find_foo = wrap_filters(find_foo)
+            mcp.tool(find_foo, name="qdrant-find", description=self.tool_settings.tool_find_description)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert tool.name == "qdrant-find"
+    assert not tool.has_description
+    assert any(i.check == "description" for i in tool.issues)
+
+
+def test_direct_call_not_confused_with_decorator_usage(tmp_path):
+    # A decorator call site (`@mcp.tool(name=...)`) shouldn't also be
+    # double-counted as a direct-call registration — its shape (no
+    # positional function argument in the call itself) doesn't match the
+    # direct-call pattern's detection criterion.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool(name="get_forecast", description="Get a weather forecast.")
+        def get_forecast(city: str) -> str:
+            try:
+                return city
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+
+
 def test_missing_readme_and_license_flagged(tmp_path):
     write(tmp_path, "server.py", "x = 1\n")
     report = analyze_repo(tmp_path)
     checks = {i.check for i in report.repo_issues}
     assert "readme" in checks
     assert "license" in checks
+
+
+def test_undocumented_tool_missing_from_readme_is_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    (tmp_path / "README.md").write_text("# x\n\nNo tools mentioned here.")
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert any("get_forecast" in i.message for i in readme_issues)
+
+
+def test_deprecated_tool_missing_from_readme_is_not_flagged(tmp_path):
+    # Real false positive found dogfooding firecrawl/firecrawl-mcp-server:
+    # `firecrawl_extract`'s description opens with "Deprecated compatibility
+    # entry point. Use firecrawl_scrape instead" and is correctly left out of
+    # the README's tool list, which only documents the current surface —
+    # flagging it pushes toward re-documenting a tool being phased out.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def legacy_extract(url: str) -> str:
+            \"\"\"Deprecated compatibility entry point. Use scrape instead.
+
+            Args:
+                url: The URL to extract.
+            \"\"\"
+            return url
+        """)
+    (tmp_path / "README.md").write_text("# x\n\nNo tools mentioned here.")
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert not any("legacy_extract" in i.message for i in readme_issues)
+
+
+def test_tool_documented_only_in_a_linked_md_file_is_not_flagged(tmp_path):
+    # Real false positive found dogfooding the official
+    # modelcontextprotocol/servers "everything" reference server: its
+    # README says "A complete list of the registered MCP primitives...
+    # can be found in the Server Features document" and links
+    # docs/features.md, which lists every tool by name — the README
+    # itself never repeats them.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_structured_content(location: str) -> str:
+            \"\"\"Demonstrate a structured response.
+
+            Args:
+                location: Where to look up.
+            \"\"\"
+            return location
+        """)
+    (tmp_path / "README.md").write_text(
+        "# x\n\nA complete list of tools can be found in the "
+        "[Server Features](docs/features.md) document.\n"
+    )
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "features.md").write_text(
+        "- `get_structured_content`: demonstrates a structured response.\n"
+    )
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert not any("get_structured_content" in i.message for i in readme_issues)
+
+
+def test_linked_doc_outside_repo_root_is_not_followed(tmp_path):
+    # A relative link that escapes the repo root (e.g. `../../secrets.md`)
+    # must not be read — guards the traversal check above, not a pattern
+    # seen in the wild, just a safety boundary worth pinning down.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_widget(id: str) -> str:
+            \"\"\"Get a widget.
+
+            Args:
+                id: The widget id.
+            \"\"\"
+            return id
+        """)
+    outside = tmp_path.parent / "outside_docs.md"
+    outside.write_text("- `get_widget`: fully documented here.\n")
+    (tmp_path / "README.md").write_text(
+        "# x\n\nSee [outside docs](../outside_docs.md) for the tool list.\n"
+    )
+
+    try:
+        report = analyze_repo(tmp_path)
+        readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+        assert any("get_widget" in i.message for i in readme_issues)
+    finally:
+        outside.unlink()
 
 
 def test_cli_runs_against_bad_example_and_reports_low_score():
@@ -420,3 +1256,190 @@ def test_cli_bad_example_ts_reports_low_score():
         text=True,
     )
     assert result.returncode == 1
+
+
+def test_bare_url_param_flagged_for_missing_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(url: Annotated[str, Field(description="The bookmark URL.")]) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issue = next(i for i in tool.issues if i.check == "url_format_hint")
+    assert "url" in issue.message
+
+
+def test_icon_url_optional_str_also_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated, Optional
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def create_link(
+            icon_url: Annotated[Optional[str], Field(description="Icon URL.")] = None,
+        ) -> str:
+            \"\"\"Create a link.\"\"\"
+            try:
+                return icon_url or ""
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issue = next(i for i in tool.issues if i.check == "url_format_hint")
+    assert "icon_url" in issue.message
+
+
+def test_field_format_kwarg_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(
+            url: Annotated[str, Field(description="The bookmark URL.", format="uri")],
+        ) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_json_schema_extra_format_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(
+            url: Annotated[str, Field(description="The bookmark URL.", json_schema_extra={"format": "uri"})],
+        ) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_default_value_field_format_clears_url_format_hint(tmp_path):
+    write(tmp_path, "server.py", """
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def add_bookmark(url: str = Field(description="The bookmark URL.", format="uri")) -> str:
+            \"\"\"Add a bookmark.\"\"\"
+            try:
+                return url
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_non_url_param_name_not_falsely_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def run_curl(curl_command: Annotated[str, Field(description="Shell command.")]) -> str:
+            \"\"\"Run a curl command.\"\"\"
+            try:
+                return curl_command
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_non_str_url_param_not_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from typing import Annotated
+        from pydantic import Field
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def fetch(url: Annotated[bytes, Field(description="Encoded URL.")]) -> str:
+            \"\"\"Fetch something.\"\"\"
+            try:
+                return str(url)
+            except ValueError as e:
+                return str(e)
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "url_format_hint" for i in tool.issues)
+
+
+def test_cjk_description_is_not_falsely_flagged_as_too_short(tmp_path):
+    # Real bug found on xpzouying/xiaohongshu-mcp (15.6k★): a complete,
+    # well-formed Chinese description is only 9 raw characters, under the
+    # 10-char threshold calibrated for English character density — but each
+    # CJK character conveys roughly a full word's worth of meaning, so a raw
+    # count unfairly flags it. Fixed via description_display_width, which
+    # counts a Wide/Fullwidth character as 2 columns (wcwidth convention).
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def check_login() -> bool:
+            \"\"\"检查小红书登录状态\"\"\"
+            return True
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    assert not any(i.check == "description" for i in tool.issues)
+
+
+def test_short_cjk_description_is_still_flagged(tmp_path):
+    # The display-width fix must not disable the check for CJK text
+    # entirely — a genuinely vague one-word description should still warn.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_weather() -> str:
+            \"\"\"天气\"\"\"
+            return "sunny"
+        """)
+    report = analyze_repo(tmp_path)
+    tool = report.tools[0]
+    issues = [i for i in tool.issues if i.check == "description"]
+    assert len(issues) == 1
+    assert issues[0].severity == "warning"
