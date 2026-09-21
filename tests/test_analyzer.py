@@ -1090,6 +1090,53 @@ def test_missing_readme_and_license_flagged(tmp_path):
     assert "license" in checks
 
 
+def test_undocumented_tool_missing_from_readme_is_flagged(tmp_path):
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    (tmp_path / "README.md").write_text("# x\n\nNo tools mentioned here.")
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert any("get_forecast" in i.message for i in readme_issues)
+
+
+def test_deprecated_tool_missing_from_readme_is_not_flagged(tmp_path):
+    # Real false positive found dogfooding firecrawl/firecrawl-mcp-server:
+    # `firecrawl_extract`'s description opens with "Deprecated compatibility
+    # entry point. Use firecrawl_scrape instead" and is correctly left out of
+    # the README's tool list, which only documents the current surface —
+    # flagging it pushes toward re-documenting a tool being phased out.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def legacy_extract(url: str) -> str:
+            \"\"\"Deprecated compatibility entry point. Use scrape instead.
+
+            Args:
+                url: The URL to extract.
+            \"\"\"
+            return url
+        """)
+    (tmp_path / "README.md").write_text("# x\n\nNo tools mentioned here.")
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert not any("legacy_extract" in i.message for i in readme_issues)
+
+
 def test_cli_runs_against_bad_example_and_reports_low_score():
     example = REPO_ROOT / "examples" / "bad_server"
     result = subprocess.run(

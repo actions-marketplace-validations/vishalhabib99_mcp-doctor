@@ -44,6 +44,16 @@ FASTMCP_DECORATOR_NAMES = {"tool"}
 # 0-9, _, -, . ... SHOULD NOT contain spaces, commas... SHOULD be unique within a server."
 VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
+# A tool whose own description says it's deprecated is a compatibility shim,
+# not something a maintainer would reasonably keep advertising in the
+# README's tool list — flagging it as an undocumented gap would push toward
+# documenting a tool the project is actively trying to phase out. Verified
+# against a real false positive dogfooding firecrawl/firecrawl-mcp-server:
+# `firecrawl_extract`'s description opens with "Deprecated compatibility
+# entry point. Use firecrawl_scrape..." and is correctly absent from the
+# README's tool list, which only documents the current surface.
+_DEPRECATED_RE = re.compile(r"\bdeprecated\b", re.IGNORECASE)
+
 
 def description_display_width(text: str) -> int:
     """Terminal/`wcwidth`-style display width: a Wide or Fullwidth character
@@ -1389,7 +1399,10 @@ def analyze_repo(root: Path) -> Report:
     if not readme:
         repo_issues.append(RepoIssue("readme", "No README found.", "error"))
     else:
-        undocumented = [t.name for t in tools if t.name not in readme_text]
+        undocumented = [
+            t.name for t in tools
+            if t.name not in readme_text and not _DEPRECATED_RE.search(t.description_text)
+        ]
         if undocumented:
             repo_issues.append(RepoIssue(
                 "readme",
