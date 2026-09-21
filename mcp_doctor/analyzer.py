@@ -54,6 +54,43 @@ VALID_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 # README's tool list, which only documents the current surface.
 _DEPRECATED_RE = re.compile(r"\bdeprecated\b", re.IGNORECASE)
 
+_MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+
+
+def _readme_and_linked_docs_text(readme: Path, root: Path) -> str:
+    """The README's own text, plus the text of any local .md file it links
+    to directly (one hop, not transitive) — a large project commonly
+    factors its actual content (a full tool/feature list, in particular)
+    out into a linked doc rather than inlining it, and a tool name search
+    that only reads the README itself would call every one of those tools
+    undocumented. Verified against a real false positive dogfooding the
+    official `modelcontextprotocol/servers` `everything` reference server:
+    its README says outright "A complete list of the registered MCP
+    primitives... can be found in the Server Features document" and links
+    `docs/features.md`, which does list every tool by its exact name — the
+    README itself never repeats them.
+
+    Only same-repo relative links are followed (no http(s)/mailto, no
+    escaping the repo root via `..`) — this reads local documentation the
+    project itself ships, not arbitrary URLs."""
+    text = readme.read_text(errors="ignore")
+    combined = [text]
+    root_resolved = root.resolve()
+    for match in _MD_LINK_RE.finditer(text):
+        target = match.group(1).split("#", 1)[0].strip()
+        if not target.lower().endswith(".md") or "://" in target or target.startswith("mailto:"):
+            continue
+        candidate = (readme.parent / target).resolve()
+        if root_resolved not in candidate.parents and candidate != root_resolved:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            combined.append(candidate.read_text(errors="ignore"))
+        except OSError:
+            continue
+    return "\n".join(combined)
+
 
 def description_display_width(text: str) -> int:
     """Terminal/`wcwidth`-style display width: a Wide or Fullwidth character
@@ -1395,7 +1432,7 @@ def analyze_repo(root: Path) -> Report:
         ))
 
     readme = next((p for p in root.glob("README*")), None)
-    readme_text = readme.read_text(errors="ignore") if readme else ""
+    readme_text = _readme_and_linked_docs_text(readme, root) if readme else ""
     if not readme:
         repo_issues.append(RepoIssue("readme", "No README found.", "error"))
     else:

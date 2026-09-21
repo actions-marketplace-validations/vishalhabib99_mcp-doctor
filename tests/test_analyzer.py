@@ -1137,6 +1137,71 @@ def test_deprecated_tool_missing_from_readme_is_not_flagged(tmp_path):
     assert not any("legacy_extract" in i.message for i in readme_issues)
 
 
+def test_tool_documented_only_in_a_linked_md_file_is_not_flagged(tmp_path):
+    # Real false positive found dogfooding the official
+    # modelcontextprotocol/servers "everything" reference server: its
+    # README says "A complete list of the registered MCP primitives...
+    # can be found in the Server Features document" and links
+    # docs/features.md, which lists every tool by name — the README
+    # itself never repeats them.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_structured_content(location: str) -> str:
+            \"\"\"Demonstrate a structured response.
+
+            Args:
+                location: Where to look up.
+            \"\"\"
+            return location
+        """)
+    (tmp_path / "README.md").write_text(
+        "# x\n\nA complete list of tools can be found in the "
+        "[Server Features](docs/features.md) document.\n"
+    )
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "features.md").write_text(
+        "- `get_structured_content`: demonstrates a structured response.\n"
+    )
+
+    report = analyze_repo(tmp_path)
+    readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+    assert not any("get_structured_content" in i.message for i in readme_issues)
+
+
+def test_linked_doc_outside_repo_root_is_not_followed(tmp_path):
+    # A relative link that escapes the repo root (e.g. `../../secrets.md`)
+    # must not be read — guards the traversal check above, not a pattern
+    # seen in the wild, just a safety boundary worth pinning down.
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_widget(id: str) -> str:
+            \"\"\"Get a widget.
+
+            Args:
+                id: The widget id.
+            \"\"\"
+            return id
+        """)
+    outside = tmp_path.parent / "outside_docs.md"
+    outside.write_text("- `get_widget`: fully documented here.\n")
+    (tmp_path / "README.md").write_text(
+        "# x\n\nSee [outside docs](../outside_docs.md) for the tool list.\n"
+    )
+
+    try:
+        report = analyze_repo(tmp_path)
+        readme_issues = [i for i in report.repo_issues if i.check == "readme"]
+        assert any("get_widget" in i.message for i in readme_issues)
+    finally:
+        outside.unlink()
+
+
 def test_cli_runs_against_bad_example_and_reports_low_score():
     example = REPO_ROOT / "examples" / "bad_server"
     result = subprocess.run(
