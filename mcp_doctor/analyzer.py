@@ -27,6 +27,7 @@ humans in the README.
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -1299,6 +1300,35 @@ _JS_TEST_SUFFIXES = (".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".spec.ts
 # directory full of subprocess calls unrelated to any tool is a common,
 # independently-authored convention (pypa/pipenv, pytorch/xla,
 # facebookexperimental/hermit and others all follow it), not a one-off.
+# A repo can genuinely contain the same source file at two paths — most
+# commonly a vendored/bundled copy shipped alongside the original for
+# packaging (e.g. a Blender addon's root-level addon.py also copied into
+# src/*/bundled/ so it can be zipped into the distributable plugin).
+# Scanning both copies independently double-counts every finding in that
+# file: the same eval/exec call, the same tool, the same SSRF hit, each
+# reported twice under different paths. Worse, each repo-level security
+# check's score penalty is capped by *occurrence count*
+# (SECURITY_CHECK_CAP), so a duplicated file can push a single real finding
+# over the cap and inflate the penalty, or — for tools — duplicate a clean
+# tool's positive contribution to the quality score. Keeping only the first
+# occurrence of each byte-identical file (by content hash, first-seen order)
+# fixes both directions without needing to know *why* the duplicate exists.
+def _dedupe_by_content(files: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result = []
+    for f in files:
+        try:
+            digest = hashlib.sha256(f.read_bytes()).hexdigest()
+        except OSError:
+            result.append(f)
+            continue
+        if digest in seen:
+            continue
+        seen.add(digest)
+        result.append(f)
+    return result
+
+
 def _is_auxiliary_file(path: Path) -> bool:
     name = path.name
     if name.startswith("test_") or name.endswith("_test.py") or name.endswith("_test.go"):
@@ -1341,7 +1371,7 @@ def analyze_repo(root: Path) -> Report:
     )
     from .ts_analyzer import find_ts_tools
 
-    py_files = [p for p in root.rglob("*.py") if "/.git/" not in str(p) and "/venv/" not in str(p) and "/node_modules/" not in str(p)]
+    py_files = _dedupe_by_content([p for p in root.rglob("*.py") if "/.git/" not in str(p) and "/venv/" not in str(p) and "/node_modules/" not in str(p)])
 
     trees: list[tuple[str, ast.Module]] = []
     unparseable: list[str] = []
@@ -1471,18 +1501,18 @@ def analyze_repo(root: Path) -> Report:
     else:
         repo_issues.extend(scan_unpinned_dependencies(root))
 
-    ts_js_files = [
+    ts_js_files = _dedupe_by_content([
         p for p in root.rglob("*")
         if p.suffix in (".ts", ".tsx", ".js", ".jsx")
         and not p.name.endswith(".d.ts")  # ambient type declarations — no executable code, ever
         and "/node_modules/" not in str(p) and "/.git/" not in str(p)
         and not _is_auxiliary_file(p)
-    ]
-    go_files = [
+    ])
+    go_files = _dedupe_by_content([
         p for p in root.rglob("*.go")
         if "/vendor/" not in str(p) and "/.git/" not in str(p)
         and not _is_auxiliary_file(p)
-    ]
+    ])
     all_files = py_files + ts_js_files + go_files
     repo_issues.extend(_scan_secrets(all_files))
     repo_issues.extend(scan_dangerous_exec(all_files))
