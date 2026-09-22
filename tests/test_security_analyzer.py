@@ -965,3 +965,99 @@ def test_unrelated_local_exec_binding_does_not_blind_a_real_exec_elsewhere(tmp_p
 
     report = analyze_repo(tmp_path)
     assert "dangerous_exec" in {i.check for i in report.repo_issues}
+
+
+def test_byte_identical_duplicate_file_is_only_scanned_once(tmp_path):
+    # Real false positive found dogfooding ahujasid/mcp-for-blender: its
+    # root-level addon.py is bundled verbatim into
+    # src/blender_mcp/bundled/addon.py for packaging into the distributable
+    # Blender plugin. Both copies are byte-identical, so every dangerous_exec
+    # and SSRF finding in addon.py was reported twice, once per path.
+    addon_source = """
+        import subprocess
+
+        def run_from_model(cmd):
+            subprocess.run(cmd, shell=True)
+        """
+    write(tmp_path, "addon.py", addon_source)
+    (tmp_path / "src" / "blender_mcp" / "bundled").mkdir(parents=True)
+    write(tmp_path, "src/blender_mcp/bundled/addon.py", addon_source)
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    dangerous_exec_hits = [i for i in report.repo_issues if i.check == "dangerous_exec"]
+    assert len(dangerous_exec_hits) == 1
+
+
+def test_duplicate_file_content_does_not_duplicate_tool_count(tmp_path):
+    # The same dedup must apply before tool-finding, not just before the
+    # repo-level security scans — otherwise a vendored copy of the actual
+    # tool-definition file would double-count a clean tool's positive
+    # contribution to the quality score.
+    tool_source = """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """
+    write(tmp_path, "server.py", tool_source)
+    (tmp_path / "bundled").mkdir()
+    write(tmp_path, "bundled/server.py", tool_source)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    assert len(report.tools) == 1
+
+
+def test_files_with_different_content_are_both_scanned(tmp_path):
+    # Guard against over-deduping: two files that happen to share a name or
+    # a similar shape but genuinely differ in content must both be scanned.
+    write(tmp_path, "addon.py", """
+        import subprocess
+        def run_from_model(cmd):
+            subprocess.run(cmd, shell=True)
+        """)
+    (tmp_path / "bundled").mkdir()
+    write(tmp_path, "bundled/addon.py", """
+        import subprocess
+        def run_from_model_v2(cmd):
+            subprocess.run(cmd, shell=True)
+        """)
+    write(tmp_path, "server.py", """
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("x")
+
+        @mcp.tool()
+        def get_forecast(city: str) -> str:
+            \"\"\"Get a weather forecast.
+
+            Args:
+                city: The city name.
+            \"\"\"
+            return city
+        """)
+    make_clean_repo(tmp_path)
+
+    report = analyze_repo(tmp_path)
+    dangerous_exec_hits = [i for i in report.repo_issues if i.check == "dangerous_exec"]
+    assert len(dangerous_exec_hits) == 2
